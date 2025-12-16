@@ -1,0 +1,6 @@
+x10-python-trading-starknet>=0.0.17
+hyperliquid-python-sdk>=0.3.0
+rich>=13.0.0
+eth-account>=0.8.0
+asyncio
+web3>=6.0.0

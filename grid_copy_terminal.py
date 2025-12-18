@@ -145,7 +145,7 @@ class GridCopyTerminal:
             'side': None,       # 'LONG', 'SHORT', or None
         }
         self.last_position_fetch = 0
-        self.position_fetch_interval = 2.0  # Check position every 2s
+        self.position_fetch_interval = 3.0  # Check position every 3s
         self.take_profit_pending = False    # Avoid duplicate TP orders
         self.take_profit_order_id = None
         self.total_realized_pnl = 0.0       # Track cumulative profit
@@ -158,6 +158,7 @@ class GridCopyTerminal:
         self.orders_skipped = 0  # Below min size
         self.orders_failed = 0   # API errors
         self.orders_rejected_postonly = 0  # Post-only rejections (would have been taker)
+        self.orders_rate_limited = 0  # Rate limit hits
         self.total_profit = 0.0
         self.start_time = None
         self.ws_messages_received = 0
@@ -1140,51 +1141,64 @@ class GridCopyTerminal:
         return False
     
     async def place_take_profit_order(self, position: Dict) -> bool:
-        """Place a limit order to close the entire position at current price"""
+        """Place a limit order to close the entire position at current price (with retry)"""
         try:
             self.take_profit_pending = True
             
             size = abs(position['size'])
             entry_price = position['entry_price']
+            market_name = self._get_extended_market(self.watch_token)
             
             # Determine side (opposite of position)
             if position['side'] == 'LONG':
                 close_side = 'SELL'
-                # Use best bid for selling (guaranteed fill)
-                market_name = self._get_extended_market(self.watch_token)
-                cached_ob = self.orderbook_cache.get(market_name, {})
-                close_price = cached_ob.get('best_bid', entry_price * 1.005)  # Fallback to entry + 0.5%
             else:
                 close_side = 'BUY'
-                market_name = self._get_extended_market(self.watch_token)
-                cached_ob = self.orderbook_cache.get(market_name, {})
-                close_price = cached_ob.get('best_ask', entry_price * 0.995)  # Fallback to entry - 0.5%
             
-            self._debug_log(f"TAKE-PROFIT ORDER: {close_side} {size} @ ${close_price:.4f}")
+            self._debug_log(f"TAKE-PROFIT ORDER: {close_side} {size}")
             self._debug_log(f"  Entry was ${entry_price:.4f}, expected profit: ${position['unrealized_pnl']:.2f}")
             
-            # Place the order (use taker price to ensure fill)
-            order_id = await self.place_order(
-                coin=self.watch_token,
-                side=close_side,
-                size=size,
-                price=close_price
-            )
-            
-            if order_id:
-                self.take_profit_order_id = order_id
-                self.total_realized_pnl += position['unrealized_pnl']
-                self.log_activity("TP", self.watch_token, 
-                    f"{close_side} {size:.4f} @ ${close_price:.4f}", "success")
-                self._debug_log(f"TAKE-PROFIT SUCCESS: Order {order_id}")
+            # Retry with backoff for rate limits
+            max_retries = 3
+            for attempt in range(max_retries):
+                # Refresh price on each attempt
+                cached_ob = self.orderbook_cache.get(market_name, {})
+                if position['side'] == 'LONG':
+                    close_price = cached_ob.get('best_bid', entry_price * 1.005)
+                else:
+                    close_price = cached_ob.get('best_ask', entry_price * 0.995)
                 
-                # Clear the pending flag after a short delay to allow fill
-                asyncio.create_task(self._clear_take_profit_pending())
-                return True
-            else:
-                self.take_profit_pending = False
-                self.log_activity("TP", self.watch_token, "Order failed", "error")
-                return False
+                self._debug_log(f"  Attempt {attempt + 1}/{max_retries} @ ${close_price:.4f}")
+                
+                # Place the order
+                order_id = await self.place_order(
+                    coin=self.watch_token,
+                    side=close_side,
+                    size=size,
+                    price=close_price
+                )
+                
+                if order_id:
+                    self.take_profit_order_id = order_id
+                    self.total_realized_pnl += position['unrealized_pnl']
+                    self.log_activity("TP", self.watch_token, 
+                        f"{close_side} {size:.4f} @ ${close_price:.4f}", "success")
+                    self._debug_log(f"TAKE-PROFIT SUCCESS: Order {order_id}")
+                    
+                    # Clear the pending flag after a short delay to allow fill
+                    asyncio.create_task(self._clear_take_profit_pending())
+                    return True
+                else:
+                    # Order failed - wait and retry
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                        self._debug_log(f"  Take-profit failed, retrying in {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+            
+            # All retries failed
+            self.take_profit_pending = False
+            self.log_activity("TP", self.watch_token, "Order failed after retries", "error")
+            return False
                 
         except Exception as e:
             self._debug_log(f"TAKE-PROFIT ERROR: {e}")
@@ -1665,7 +1679,14 @@ class GridCopyTerminal:
                         self._verbose_log(f"    ❌ Full Error: {error_msg}")
                         
                         # Check error type
-                        if '1121' in error_msg or '1123' in error_msg:
+                        if '429' in error_msg or 'rate limit' in error_msg.lower() or 'Rate limited' in error_msg:
+                            # Rate limited - wait and retry
+                            self.orders_rate_limited += 1
+                            self._debug_log(f"Rate limited, waiting 2s before retry...")
+                            self.log_activity("PLACE", coin, "Rate limited", "skip")
+                            await asyncio.sleep(2.0)
+                            continue  # Retry same precision
+                        elif '1121' in error_msg or '1123' in error_msg:
                             # Quantity precision error - try next step size
                             self._verbose_log(f"    → Step {try_step} wrong, trying next...")
                             break  # Break inner loop, try next step_size
@@ -1970,13 +1991,14 @@ class GridCopyTerminal:
             self.last_balance_for_retry = self.available_balance
             return False
     
-    async def _place_orders_parallel(self, orders_to_place: list, batch_size: int = 10) -> int:
-        """Place multiple orders in parallel batches for speed"""
+    async def _place_orders_parallel(self, orders_to_place: list, batch_size: int = 5) -> int:
+        """Place multiple orders in parallel batches for speed (rate-limit aware)"""
         self._debug_log(f"PARALLEL: Placing {len(orders_to_place)} orders in batches of {batch_size}")
         
         total_placed = 0
         
         # Process in batches to avoid overwhelming the API
+        # Rate limit: 1000/min = ~16/sec, so batch of 5 + 0.5s delay = ~10/sec max
         for i in range(0, len(orders_to_place), batch_size):
             batch = orders_to_place[i:i + batch_size]
             
@@ -1995,6 +2017,10 @@ class GridCopyTerminal:
                     total_placed += 1
                 elif isinstance(result, Exception):
                     self._debug_log(f"PARALLEL: Exception - {result}")
+            
+            # Delay between batches to respect rate limits (1000 req/min)
+            if i + batch_size < len(orders_to_place):
+                await asyncio.sleep(0.5)
         
         self._debug_log(f"PARALLEL: Placed {total_placed}/{len(orders_to_place)} orders")
         return total_placed
@@ -2059,7 +2085,7 @@ class GridCopyTerminal:
         self.console.print(f"[cyan]Placing {len(orders_to_place)} orders in parallel...[/cyan]")
         start_time = time.time()
         
-        placed = await self._place_orders_parallel(orders_to_place, batch_size=10)
+        placed = await self._place_orders_parallel(orders_to_place, batch_size=5)
         
         elapsed = time.time() - start_time
         rate = placed / elapsed if elapsed > 0 else 0
@@ -2245,7 +2271,7 @@ class GridCopyTerminal:
         text.append(f"Fills Detected   ", style="white")
         text.append(f"{self.orders_filled}\n", style="green")
         
-        if self.orders_skipped > 0 or self.orders_failed > 0 or self.orders_rejected_postonly > 0:
+        if self.orders_skipped > 0 or self.orders_failed > 0 or self.orders_rejected_postonly > 0 or self.orders_rate_limited > 0:
             text.append(f"\n", style="white")
             text.append(f"Skipped (size)   ", style="white")
             text.append(f"{self.orders_skipped}\n", style="dim")
@@ -2253,6 +2279,9 @@ class GridCopyTerminal:
             text.append(f"{self.orders_failed}\n", style="red")
             text.append(f"Rejected (maker) ", style="white")
             text.append(f"{self.orders_rejected_postonly}\n", style="yellow")
+            if self.orders_rate_limited > 0:
+                text.append(f"Rate Limited     ", style="white")
+                text.append(f"{self.orders_rate_limited}\n", style="red")
         
         text.append(f"\n", style="white")
         

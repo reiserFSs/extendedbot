@@ -891,12 +891,13 @@ class GridCopyTerminal:
         """Start WebSocket stream for real-time orderbook updates (10ms best bid/ask)"""
         
         # Use depth=1 for best bid/ask only (10ms updates)
-        ws_url = f"wss://stream.extended.exchange/v1/orderbooks/{market_name}?depth=1"
+        ws_url = f"wss://api.starknet.extended.exchange/v1/orderbooks/{market_name}?depth=1"
         self._debug_log(f"ORDERBOOK WS: Connecting to {ws_url}")
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(ws_url) as ws:
+                # heartbeat=10 handles ping/pong automatically (server pings every 15s, expects pong within 10s)
+                async with session.ws_connect(ws_url, heartbeat=10) as ws:
                     self.orderbook_ws = ws
                     self.orderbook_ws_connected = True
                     self._debug_log(f"ORDERBOOK WS: Connected")
@@ -911,6 +912,8 @@ class GridCopyTerminal:
                                 self._process_orderbook_message(market_name, data)
                             except json.JSONDecodeError:
                                 pass
+                        elif msg.type == aiohttp.WSMsgType.PING:
+                            await ws.pong(msg.data)
                         elif msg.type == aiohttp.WSMsgType.ERROR:
                             self._debug_log(f"ORDERBOOK WS ERROR: {ws.exception()}")
                             break

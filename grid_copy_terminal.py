@@ -779,7 +779,7 @@ class GridCopyTerminal:
                         
                     except Exception as e:
                         error_msg = str(e)
-                        self._debug_log(f"    ❌ Error: {error_msg[:100]}")
+                        self._debug_log(f"    ❌ Full Error: {error_msg}")
                         
                         # Check error type
                         if '1121' in error_msg or '1123' in error_msg:
@@ -791,8 +791,9 @@ class GridCopyTerminal:
                             self._debug_log(f"    → Tick {try_tick} wrong, trying next...")
                             continue  # Try next tick_size
                         else:
-                            # Different error - stop retrying
-                            self._debug_log(f"    → Non-precision error, stopping")
+                            # Different error - log full details and stop retrying
+                            self._debug_log(f"    → Non-precision error code, stopping retries")
+                            self._debug_log(f"    → Error details: {repr(e)}")
                             self.log_activity("PLACE", coin, error_msg[:40], "error")
                             return None
             

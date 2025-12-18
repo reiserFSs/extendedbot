@@ -111,6 +111,11 @@ class GridCopyTerminal:
         self.margin_failed_targets: set = set()   # target_ids that failed due to margin
         self.last_balance_for_retry = 0.0         # Balance when margin failures occurred
         
+        # Orderbook cache (short TTL to stay fresh but reduce API calls)
+        self.orderbook_cache: Dict[str, Dict] = {}  # market -> {best_bid, best_ask, timestamp}
+        self.orderbook_cache_ttl = 2.0  # 2s cache - background refresh keeps it fresh
+        self.orderbook_refresh_task = None
+        
         # Pending actions queue (from WebSocket events)
         self.pending_actions: asyncio.Queue = None  # Will init in run()
         
@@ -872,6 +877,122 @@ class GridCopyTerminal:
         }
         self._debug_log(f"💾 Saved learned specs for {coin}: step={step_size}, tick={tick_size}")
     
+    async def _fetch_orderbook(self, market_name: str) -> Dict:
+        """Get orderbook from cache (non-blocking). Background task keeps it fresh."""
+        # Always return from cache - background task keeps it updated
+        if market_name in self.orderbook_cache:
+            cached = self.orderbook_cache[market_name]
+            return {'best_bid': cached['best_bid'], 'best_ask': cached['best_ask']}
+        
+        # Cache miss - do a quick fetch (only happens on first call)
+        return await self._refresh_orderbook(market_name)
+    
+    async def _refresh_orderbook(self, market_name: str) -> Dict:
+        """Actually fetch orderbook from API and update cache"""
+        try:
+            best_bid = 0
+            best_ask = 0
+            
+            # Method 1: orderbook module
+            if hasattr(self.extended_client, 'orderbook'):
+                try:
+                    ob = await self.extended_client.orderbook.get_orderbook(market_name)
+                    if ob and hasattr(ob, 'data'):
+                        data = ob.data
+                        best_bid = float(data.bids[0].price) if data.bids else 0
+                        best_ask = float(data.asks[0].price) if data.asks else 0
+                except Exception as e:
+                    pass
+            
+            # Method 2: markets_info with ticker
+            if (best_bid == 0 or best_ask == 0) and hasattr(self.extended_client, 'markets_info'):
+                try:
+                    markets = await self.extended_client.markets_info.get_markets(market_names=[market_name])
+                    if markets and markets.data:
+                        md = markets.data[0]
+                        best_bid = float(getattr(md, 'best_bid', 0) or getattr(md, 'bid_price', 0) or 0)
+                        best_ask = float(getattr(md, 'best_ask', 0) or getattr(md, 'ask_price', 0) or 0)
+                        if best_bid == 0 and best_ask == 0:
+                            index_price = float(getattr(md, 'index_price', 0) or 0)
+                            if index_price > 0:
+                                best_bid = index_price
+                                best_ask = index_price
+                except Exception as e:
+                    pass
+            
+            # Cache the result
+            self.orderbook_cache[market_name] = {
+                'best_bid': best_bid,
+                'best_ask': best_ask,
+                'timestamp': time.time()
+            }
+            
+            return {'best_bid': best_bid, 'best_ask': best_ask}
+            
+        except Exception as e:
+            self._debug_log(f"ORDERBOOK REFRESH ERROR: {e}")
+            return {'best_bid': 0, 'best_ask': 0}
+    
+    async def _background_orderbook_refresh(self):
+        """Background task to keep orderbook cache fresh"""
+        while self.is_running:
+            try:
+                if self.watch_token:
+                    market_name = self._get_extended_market(self.watch_token)
+                    if market_name:
+                        await self._refresh_orderbook(market_name)
+                await asyncio.sleep(1.0)  # Refresh every 1 second
+            except Exception as e:
+                self._debug_log(f"Background orderbook error: {e}")
+                await asyncio.sleep(1.0)
+    
+    def _adjust_price_for_maker(self, price: float, side: str, best_bid: float, best_ask: float, tick_size: float) -> float:
+        """
+        Adjust price to ensure order rests on book as maker.
+        
+        For BUY: price must be <= best_bid (or lower)
+        For SELL: price must be >= best_ask (or higher)
+        
+        If target price would cross the spread, adjust to the edge.
+        """
+        if best_bid <= 0 or best_ask <= 0:
+            # No orderbook data, use small offset from target price
+            offset = price * 0.0002  # 2 basis points
+            if side == 'BUY':
+                return price - offset
+            else:
+                return price + offset
+        
+        if side == 'BUY':
+            if price >= best_ask:
+                # Would cross spread - place at best bid instead
+                adjusted = best_bid
+                self._debug_log(f"  MAKER ADJ: BUY {price} >= ask {best_ask}, using bid {best_bid}")
+            elif price > best_bid:
+                # Between bid and ask - place at best bid to be safe
+                adjusted = best_bid
+                self._debug_log(f"  MAKER ADJ: BUY {price} > bid {best_bid}, using bid")
+            else:
+                # Already below best bid - use target price
+                adjusted = price
+        else:  # SELL
+            if price <= best_bid:
+                # Would cross spread - place at best ask instead
+                adjusted = best_ask
+                self._debug_log(f"  MAKER ADJ: SELL {price} <= bid {best_bid}, using ask {best_ask}")
+            elif price < best_ask:
+                # Between bid and ask - place at best ask to be safe
+                adjusted = best_ask
+                self._debug_log(f"  MAKER ADJ: SELL {price} < ask {best_ask}, using ask")
+            else:
+                # Already above best ask - use target price
+                adjusted = price
+        
+        # Round to tick size
+        adjusted = round(adjusted / tick_size) * tick_size
+        
+        return adjusted
+    
     async def place_order(self, coin: str, side: str, size: float, price: float) -> Optional[str]:
         """Place a limit order on Extended with automatic precision learning"""
         try:
@@ -881,14 +1002,29 @@ class GridCopyTerminal:
                 self.log_activity("PLACE", coin, f"Market not found", "error")
                 return None
             
-            # Get initial precision specs
+            # Get initial precision specs first (need tick_size for adjustment)
             specs = await self._get_precision_specs(coin)
             initial_step = specs['step_size']
             initial_tick = specs['tick_size']
             
             self._debug_log(f"PLACE ORDER: {coin} {side}")
             self._debug_log(f"  Market: {market_name}")
-            self._debug_log(f"  Raw size: {size}, Raw price: {price}")
+            self._debug_log(f"  Target price: {price}")
+            
+            # Fetch orderbook and adjust price to ensure maker execution
+            orderbook = await self._fetch_orderbook(market_name)
+            original_price = price
+            price = self._adjust_price_for_maker(
+                price, side, 
+                orderbook['best_bid'], 
+                orderbook['best_ask'],
+                initial_tick
+            )
+            
+            if price != original_price:
+                self._debug_log(f"  Adjusted price: {original_price} -> {price} (maker)")
+            
+            self._debug_log(f"  Raw size: {size}, Final price: {price}")
             self._debug_log(f"  Initial step: {initial_step}, Initial tick: {initial_tick}")
             
             # Build list of step sizes to try
@@ -1582,6 +1718,15 @@ class GridCopyTerminal:
         else:
             self.console.print(f"[green]✓ Available balance: ${self.available_balance:.2f}[/green]")
         
+        # Pre-fetch orderbook for zero-latency maker pricing
+        if self.watch_token:
+            market_name = self._get_extended_market(self.watch_token)
+            if market_name:
+                self.console.print("[dim]Fetching orderbook...[/dim]")
+                ob = await self._refresh_orderbook(market_name)
+                if ob['best_bid'] > 0:
+                    self.console.print(f"[green]✓ Orderbook: bid=${ob['best_bid']:.4f}, ask=${ob['best_ask']:.4f}[/green]")
+        
         # Do initial REST sync to get current orders
         self.console.print("[dim]Fetching initial orders...[/dim]")
         try:
@@ -1613,6 +1758,9 @@ class GridCopyTerminal:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         
         keyboard_task = asyncio.create_task(handle_keyboard())
+        
+        # Start background orderbook refresh for zero-latency maker pricing
+        orderbook_task = asyncio.create_task(self._background_orderbook_refresh())
         
         last_rest_sync = time.time()
         
@@ -1656,6 +1804,7 @@ class GridCopyTerminal:
             self._debug_log("Entering finally block")
             self.is_running = False
             keyboard_task.cancel()
+            orderbook_task.cancel()
             
             # Cleanup - cancel all our orders
             self.console.print("\n[yellow]Cleaning up - cancelling all orders...[/yellow]")

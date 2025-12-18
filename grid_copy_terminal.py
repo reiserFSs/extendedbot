@@ -162,6 +162,8 @@ class GridCopyTerminal:
         self.position_mirror_enabled = False  # Set from config
         self.copy_side_mode = "BOTH"          # "BUY", "SELL", or "BOTH"
         self.orders_filtered_by_mirror = 0    # Count of orders skipped due to mirror mode
+        self.last_flip_time = 0               # Timestamp of last direction flip
+        self.flip_count = 0                   # Number of direction flips detected
         
         # Stats
         self.orders_placed = 0
@@ -613,11 +615,21 @@ class GridCopyTerminal:
                 entry_price = float(pos.get('entryPx', 0) or 0)
                 unrealized_pnl = float(pos.get('unrealizedPnl', 0) or 0)
                 
+                # Determine new side
+                new_side = 'LONG' if size > 0 else ('SHORT' if size < 0 else None)
+                old_side = self.target_position.get('side')
+                
+                # Detect direction FLIP (not just position close)
+                direction_flipped = (
+                    old_side is not None and 
+                    new_side is not None and 
+                    old_side != new_side
+                )
+                
                 # Update target position
-                old_side = self.target_position['side']
                 self.target_position = {
                     'size': size,
-                    'side': 'LONG' if size > 0 else ('SHORT' if size < 0 else None),
+                    'side': new_side,
                     'entry_price': entry_price,
                     'unrealized_pnl': unrealized_pnl,
                 }
@@ -634,12 +646,36 @@ class GridCopyTerminal:
                     # Target is FLAT → copy both sides
                     self.copy_side_mode = "BOTH"
                 
-                # Log if mode changed
-                if old_mode != self.copy_side_mode:
-                    self._debug_log(f"TARGET POSITION CHANGED: {old_side} -> {self.target_position['side']}")
+                # Handle direction flip
+                if direction_flipped:
+                    self._debug_log(f"TARGET FLIPPED: {old_side} -> {new_side}")
+                    self.log_activity("MIRROR", self.watch_token, 
+                        f"⚠ Target flipped {old_side} → {new_side}", "warning")
+                    
+                    # Track flip
+                    self.flip_count += 1
+                    self.last_flip_time = time.time()
+                    
+                    # Cancel all our open orders (they're wrong direction now)
+                    # Our position stays - will naturally close or we can TP it
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            asyncio.create_task(self._cancel_all_orders_on_flip(old_side, new_side))
+                        else:
+                            asyncio.run_coroutine_threadsafe(
+                                self._cancel_all_orders_on_flip(old_side, new_side),
+                                loop
+                            )
+                    except Exception as e:
+                        self._debug_log(f"FLIP CANCEL ERROR: {e}")
+                
+                # Log if mode changed (but not a flip)
+                elif old_mode != self.copy_side_mode:
+                    self._debug_log(f"TARGET POSITION CHANGED: {old_side} -> {new_side}")
                     self._debug_log(f"COPY MODE CHANGED: {old_mode} -> {self.copy_side_mode}")
                     self.log_activity("MIRROR", self.watch_token, 
-                        f"Target {self.target_position['side'] or 'FLAT'} → copy {self.copy_side_mode}", "info")
+                        f"Target {new_side or 'FLAT'} → copy {self.copy_side_mode}", "info")
                 
                 break  # Found our token
                 
@@ -725,6 +761,7 @@ class GridCopyTerminal:
         
         target_entry = self.target_position.get('entry_price', 0)
         target_side = self.target_position.get('side')
+        our_side = self.current_position.get('side')
         
         if target_side == 'SHORT':
             # Always copy SELL (adds to short)
@@ -732,8 +769,13 @@ class GridCopyTerminal:
                 return True
             # Copy BUY only if price < entry (take profit to close short)
             if order_side == 'BUY' and target_entry > 0 and order_price < target_entry:
-                self._verbose_log(f"  TP detected: BUY @ {order_price} < entry {target_entry}")
-                return True
+                # Only copy TP if WE also have a short position to close
+                if our_side == 'SHORT':
+                    self._verbose_log(f"  TP detected: BUY @ {order_price} < entry {target_entry}")
+                    return True
+                else:
+                    self._verbose_log(f"  TP skipped: BUY @ {order_price} but we're {our_side or 'FLAT'}")
+                    return False
             # Skip BUY above entry (would be stop loss)
             return False
         
@@ -743,8 +785,13 @@ class GridCopyTerminal:
                 return True
             # Copy SELL only if price > entry (take profit to close long)
             if order_side == 'SELL' and target_entry > 0 and order_price > target_entry:
-                self._verbose_log(f"  TP detected: SELL @ {order_price} > entry {target_entry}")
-                return True
+                # Only copy TP if WE also have a long position to close
+                if our_side == 'LONG':
+                    self._verbose_log(f"  TP detected: SELL @ {order_price} > entry {target_entry}")
+                    return True
+                else:
+                    self._verbose_log(f"  TP skipped: SELL @ {order_price} but we're {our_side or 'FLAT'}")
+                    return False
             # Skip SELL below entry (would be stop loss)
             return False
         
@@ -2129,6 +2176,61 @@ class GridCopyTerminal:
             self.log_activity("CANCEL", self.watch_token, error_msg[:50], "error")
             return False
     
+    async def _cancel_all_orders_on_flip(self, old_side: str, new_side: str):
+        """
+        Cancel all our open orders when target flips direction.
+        Our position stays open (will TP or naturally close).
+        """
+        self._debug_log(f"FLIP DETECTED: {old_side} -> {new_side}, cancelling all orders...")
+        
+        if not self.our_orders:
+            self._debug_log("No orders to cancel")
+            return
+        
+        # Get list of order IDs to cancel
+        order_ids = list(self.our_orders.keys())
+        cancelled = 0
+        failed = 0
+        
+        self.log_activity("FLIP", self.watch_token, f"Cancelling {len(order_ids)} orders...", "warning")
+        
+        # Cancel in batches to avoid rate limits
+        batch_size = 5
+        for i in range(0, len(order_ids), batch_size):
+            batch = order_ids[i:i + batch_size]
+            
+            for order_id in batch:
+                try:
+                    success = await self.cancel_order(order_id)
+                    if success:
+                        cancelled += 1
+                        # Remove from tracking
+                        if order_id in self.our_orders:
+                            del self.our_orders[order_id]
+                        # Remove from mapping
+                        target_id = None
+                        for tid, oid in list(self.order_mapping.items()):
+                            if oid == order_id:
+                                target_id = tid
+                                break
+                        if target_id:
+                            del self.order_mapping[target_id]
+                    else:
+                        failed += 1
+                except Exception as e:
+                    self._debug_log(f"FLIP CANCEL ERROR for {order_id}: {e}")
+                    failed += 1
+            
+            # Small delay between batches
+            if i + batch_size < len(order_ids):
+                await asyncio.sleep(0.5)
+        
+        self._debug_log(f"FLIP CANCEL COMPLETE: {cancelled} cancelled, {failed} failed")
+        self.log_activity("FLIP", self.watch_token, f"Cancelled {cancelled}/{len(order_ids)}", "success")
+        
+        # Clear margin failed targets since we're starting fresh
+        self.margin_failed_targets.clear()
+    
     async def sync_orders(self, parallel: bool = True):
         """
         Backup sync logic - REST poll to catch anything WebSocket missed.
@@ -2530,6 +2632,10 @@ class GridCopyTerminal:
             if self.orders_skipped_mirror > 0:
                 text.append(f"Filtered         ", style="white")
                 text.append(f"{self.orders_skipped_mirror} orders\n", style="yellow")
+            
+            if self.flip_count > 0:
+                text.append(f"Flips Detected   ", style="white")
+                text.append(f"{self.flip_count}\n", style="yellow")
         
         # Our position info
         pos = self.current_position

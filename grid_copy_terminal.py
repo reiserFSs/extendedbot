@@ -15,6 +15,7 @@ import asyncio
 import time
 import json
 import sys
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -81,6 +82,10 @@ class GridCopyTerminal:
         self.config_manager = GridCopyConfig()
         self.config = {}
         
+        # Debug mode
+        self.debug_mode = False
+        self.debug_logger = None
+        
         # Connections
         self.hyperliquid_info = None
         self.extended_client = None
@@ -119,6 +124,51 @@ class GridCopyTerminal:
         
         # Activity log
         self.activity_log: List[Dict] = []
+    
+    def _setup_debug_logger(self):
+        """Set up rotating debug log file"""
+        from logging.handlers import RotatingFileHandler
+        
+        # Create logs directory
+        log_dir = Path.home() / '.extended_copy_terminal' / 'logs'
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        log_file = log_dir / 'grid_copy_debug.log'
+        
+        self.debug_logger = logging.getLogger('grid_copy_debug')
+        self.debug_logger.setLevel(logging.DEBUG)
+        
+        # Remove existing handlers
+        self.debug_logger.handlers.clear()
+        
+        # Rotating file handler (5MB max, keep 3 backups)
+        handler = RotatingFileHandler(
+            log_file,
+            maxBytes=5*1024*1024,
+            backupCount=3
+        )
+        
+        formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        handler.setFormatter(formatter)
+        
+        self.debug_logger.addHandler(handler)
+        
+        # Log startup
+        self.debug_logger.info("=" * 60)
+        self.debug_logger.info("Grid Copy Terminal Debug Started")
+        self.debug_logger.info(f"Watch token: {self.watch_token}")
+        self.debug_logger.info(f"Size percent: {self.config.get('size_percent', 0)}")
+        self.debug_logger.info("=" * 60)
+        
+        self.console.print(f"[dim]Debug log: {log_file}[/dim]")
+    
+    def _debug_log(self, message: str):
+        """Write to debug log if enabled"""
+        if self.debug_mode and self.debug_logger:
+            self.debug_logger.info(message)
     
     async def setup(self):
         """Interactive setup wizard"""
@@ -160,6 +210,9 @@ class GridCopyTerminal:
         # Network
         config['use_testnet'] = input("Use Testnet? (y/N): ").strip().lower() == 'y'
         
+        # Debug mode
+        config['debug_mode'] = input("Enable Debug Mode? (y/N): ").strip().lower() == 'y'
+        
         self.config_manager.save(config)
         self.config = config
         
@@ -173,6 +226,13 @@ class GridCopyTerminal:
         if not self.watch_token:
             self.console.print("[red]Token is required[/red]")
             return False
+        
+        # Set up debug mode if enabled (CLI flag takes precedence)
+        if not self.debug_mode:  # Don't override if set via CLI
+            self.debug_mode = self.config.get('debug_mode', False)
+        
+        if self.debug_mode and not self.debug_logger:
+            self._setup_debug_logger()
         
         self.console.print(f"\n[green]Will copy {self.watch_token} orders from target[/green]")
         return True
@@ -352,11 +412,15 @@ class GridCopyTerminal:
         if coin != self.watch_token:
             return
         
+        self._debug_log(f"WS ORDER EVENT: {order_info}")
+        
         oid = str(order_info.get('oid', ''))
         side = order_info.get('side', '')  # 'B' or 'A'
         price = float(order_info.get('limitPx', 0))
         size = float(order_info.get('sz', 0) or order_info.get('origSz', 0))
         status = order_info.get('status', 'open')
+        
+        self._debug_log(f"  Parsed: oid={oid}, side={side}, price={price}, size={size}, status={status}")
         
         # Normalize status
         if status in ['resting', 'open']:
@@ -376,10 +440,13 @@ class GridCopyTerminal:
             # New or updated order
             was_new = oid not in self.target_orders
             self.target_orders[oid] = order_record
+            self._debug_log(f"  Status=open, was_new={was_new}")
             
             if was_new and oid not in self.order_mapping:
                 # New order - place our matching order
                 our_size = self.calculate_our_size(size, price)
+                self._debug_log(f"  Calculated our_size={our_size}")
+                
                 if our_size > 0:
                     our_order_id = await self.place_order(
                         coin=coin,
@@ -476,7 +543,9 @@ class GridCopyTerminal:
     async def _get_precision_specs(self, coin: str) -> Dict:
         """Get precision specs for a coin"""
         if coin in self.precision_cache:
-            return self.precision_cache[coin]
+            cached = self.precision_cache[coin]
+            self._debug_log(f"PRECISION: Using cached specs for {coin}: step={cached['step_size']}, tick={cached['tick_size']}")
+            return cached
         
         # Defaults
         specs = {
@@ -486,20 +555,50 @@ class GridCopyTerminal:
             'price_decimals': 4
         }
         
+        self._debug_log(f"PRECISION: Fetching specs for {coin}...")
+        
         try:
             market_name = self._get_extended_market(coin)
+            self._debug_log(f"  Market name: {market_name}")
+            
             if market_name:
                 markets = await self.extended_client.markets_info.get_markets(market_names=[market_name])
+                self._debug_log(f"  Markets response: {markets}")
+                
                 if markets and markets.data:
                     md = markets.data[0]
+                    self._debug_log(f"  Market data type: {type(md)}")
+                    
+                    # Log all attributes
+                    if hasattr(md, '__dict__'):
+                        self._debug_log(f"  Market data attrs: {md.__dict__}")
+                    
                     # Try to extract specs
                     if hasattr(md, 'qty_step'):
                         specs['step_size'] = float(md.qty_step)
+                        self._debug_log(f"  Found qty_step: {md.qty_step}")
+                    else:
+                        self._debug_log(f"  No qty_step attribute found")
+                    
                     if hasattr(md, 'price_tick'):
                         specs['tick_size'] = float(md.price_tick)
-        except:
-            pass
+                        self._debug_log(f"  Found price_tick: {md.price_tick}")
+                    else:
+                        self._debug_log(f"  No price_tick attribute found")
+                    
+                    # Look for alternative attribute names
+                    for attr in ['step', 'size_step', 'lot_size', 'min_qty', 'quantity_step']:
+                        if hasattr(md, attr):
+                            self._debug_log(f"  Found alternative attr {attr}: {getattr(md, attr)}")
+                    
+                    for attr in ['tick', 'price_step', 'tick_size', 'min_tick']:
+                        if hasattr(md, attr):
+                            self._debug_log(f"  Found alternative attr {attr}: {getattr(md, attr)}")
+                            
+        except Exception as e:
+            self._debug_log(f"  EXCEPTION fetching specs: {type(e).__name__}: {e}")
         
+        self._debug_log(f"  Final specs for {coin}: step={specs['step_size']}, tick={specs['tick_size']}")
         self.precision_cache[coin] = specs
         return specs
     
@@ -563,6 +662,7 @@ class GridCopyTerminal:
         try:
             market_name = self._get_extended_market(coin)
             if not market_name:
+                self._debug_log(f"PLACE FAILED: Market not found for {coin}")
                 self.log_activity("PLACE", coin, f"Market not found", "error")
                 return None
             
@@ -571,16 +671,30 @@ class GridCopyTerminal:
             step_size = specs['step_size']
             tick_size = specs['tick_size']
             
+            self._debug_log(f"PLACE ORDER: {coin} {side}")
+            self._debug_log(f"  Market: {market_name}")
+            self._debug_log(f"  Raw size: {size}, Raw price: {price}")
+            self._debug_log(f"  Step size: {step_size}, Tick size: {tick_size}")
+            
             # Round size and price
             rounded_size = round(size / step_size) * step_size
             rounded_price = round(price / tick_size) * tick_size
             
+            self._debug_log(f"  Rounded size: {rounded_size}, Rounded price: {rounded_price}")
+            
             if rounded_size <= 0:
+                self._debug_log(f"  SKIP: Size {size} rounds to {rounded_size} (below minimum)")
                 self.log_activity("PLACE", coin, f"Size too small: {size:.6f}", "skip")
                 return None
             
             # Place order using direct client method
             order_side = OrderSide.BUY if side == 'BUY' else OrderSide.SELL
+            
+            self._debug_log(f"  Calling extended_client.place_order()...")
+            self._debug_log(f"    market_name={market_name}")
+            self._debug_log(f"    amount_of_synthetic={Decimal(str(rounded_size))}")
+            self._debug_log(f"    price={Decimal(str(rounded_price))}")
+            self._debug_log(f"    side={order_side}")
             
             result = await self.extended_client.place_order(
                 market_name=market_name,
@@ -589,29 +703,45 @@ class GridCopyTerminal:
                 side=order_side,
             )
             
+            self._debug_log(f"  API Response: {result}")
+            self._debug_log(f"  Response type: {type(result)}")
+            
             if result:
+                # Log all attributes of result
+                if hasattr(result, '__dict__'):
+                    self._debug_log(f"  Response attrs: {result.__dict__}")
+                
                 order_id = None
                 if hasattr(result, 'id') and result.id:
                     order_id = str(result.id)
+                    self._debug_log(f"  Found order_id via .id: {order_id}")
                 elif hasattr(result, 'order_id') and result.order_id:
                     order_id = str(result.order_id)
+                    self._debug_log(f"  Found order_id via .order_id: {order_id}")
                 elif hasattr(result, 'data') and result.data:
+                    self._debug_log(f"  Result has .data: {result.data}")
                     if hasattr(result.data, 'id'):
                         order_id = str(result.data.id)
+                        self._debug_log(f"  Found order_id via .data.id: {order_id}")
                 
                 if order_id:
+                    self._debug_log(f"  SUCCESS: Order placed, id={order_id}")
                     self.orders_placed += 1
                     self.log_activity("PLACE", coin, f"{side} {rounded_size:.4f} @ ${rounded_price:.4f}", "success")
                     return order_id
             
+            self._debug_log(f"  FAILED: No order ID in response")
             self.log_activity("PLACE", coin, "No order ID returned", "error")
             return None
             
         except Exception as e:
             error_msg = str(e)
+            self._debug_log(f"  EXCEPTION: {type(e).__name__}: {error_msg}")
+            self._debug_log(f"  Full exception: {repr(e)}")
+            
             # Check for common errors
             if "1123" in error_msg or "precision" in error_msg.lower():
-                self.log_activity("PLACE", coin, "Precision error - will retry", "error")
+                self.log_activity("PLACE", coin, "Precision error", "error")
             else:
                 self.log_activity("PLACE", coin, error_msg[:50], "error")
             return None
@@ -621,12 +751,17 @@ class GridCopyTerminal:
         try:
             market_name = self._get_extended_market(self.watch_token)
             if not market_name:
+                self._debug_log(f"CANCEL FAILED: No market for {self.watch_token}")
                 return False
             
-            await self.extended_client.orders.cancel_order(
+            self._debug_log(f"CANCEL ORDER: {order_id} on {market_name}")
+            
+            result = await self.extended_client.orders.cancel_order(
                 market=market_name,
                 order_id=order_id
             )
+            
+            self._debug_log(f"  Cancel result: {result}")
             
             self.orders_cancelled += 1
             self.log_activity("CANCEL", self.watch_token, f"Order {order_id[:8]}...", "success")
@@ -634,6 +769,9 @@ class GridCopyTerminal:
             
         except Exception as e:
             error_msg = str(e)
+            self._debug_log(f"CANCEL EXCEPTION: {type(e).__name__}: {error_msg}")
+            self._debug_log(f"  Full exception: {repr(e)}")
+            
             # Some errors are expected (order already filled/cancelled)
             if "not found" in error_msg.lower() or "already" in error_msg.lower():
                 self.log_activity("CANCEL", self.watch_token, "Order already gone", "skip")
@@ -943,6 +1081,11 @@ class GridCopyTerminal:
     
     async def run(self):
         """Main run loop"""
+        # Set up debug logger early if enabled via CLI
+        if self.debug_mode and not self.debug_logger:
+            self._setup_debug_logger()
+            self._debug_log("Grid Copy Terminal starting (debug enabled via CLI)")
+        
         # Setup
         if not await self.setup():
             return
@@ -1037,7 +1180,16 @@ class GridCopyTerminal:
 
 
 async def main():
+    # Check for --debug flag
+    debug_flag = '--debug' in sys.argv or '-d' in sys.argv
+    
     terminal = GridCopyTerminal()
+    
+    # Override debug mode if flag is passed
+    if debug_flag:
+        terminal.debug_mode = True
+        terminal.console.print("[yellow]Debug mode enabled via command line[/yellow]")
+    
     await terminal.run()
 
 

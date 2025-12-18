@@ -673,22 +673,32 @@ class GridCopyTerminal:
             self._debug_log(f"BALANCE: Raw response: {balance}")
             
             if balance:
-                # Try to extract available balance
-                if hasattr(balance, 'available'):
-                    self.available_balance = float(balance.available)
-                elif hasattr(balance, 'data') and balance.data:
-                    if hasattr(balance.data, 'available'):
-                        self.available_balance = float(balance.data.available)
-                    elif hasattr(balance.data, 'free'):
-                        self.available_balance = float(balance.data.free)
-                elif isinstance(balance, dict):
-                    self.available_balance = float(balance.get('available', balance.get('free', 0)))
+                # Extended returns: status='OK' data=BalanceModel(available_for_trade=..., equity=..., balance=...)
+                if hasattr(balance, 'data') and balance.data:
+                    data = balance.data
+                    # Try available_for_trade first (Extended's field name)
+                    if hasattr(data, 'available_for_trade'):
+                        self.available_balance = float(data.available_for_trade)
+                    elif hasattr(data, 'available'):
+                        self.available_balance = float(data.available)
+                    elif hasattr(data, 'free'):
+                        self.available_balance = float(data.free)
+                    elif hasattr(data, 'balance'):
+                        self.available_balance = float(data.balance)
+                    
+                    # Get equity/total
+                    if hasattr(data, 'equity'):
+                        self.total_balance = float(data.equity)
+                    elif hasattr(data, 'balance'):
+                        self.total_balance = float(data.balance)
                 
-                # Also try total balance
-                if hasattr(balance, 'total'):
-                    self.total_balance = float(balance.total)
-                elif hasattr(balance, 'equity'):
-                    self.total_balance = float(balance.equity)
+                # Fallback: try direct attributes
+                elif hasattr(balance, 'available_for_trade'):
+                    self.available_balance = float(balance.available_for_trade)
+                elif hasattr(balance, 'available'):
+                    self.available_balance = float(balance.available)
+                elif isinstance(balance, dict):
+                    self.available_balance = float(balance.get('available_for_trade', balance.get('available', balance.get('free', 0))))
                 
                 self._debug_log(f"BALANCE: Available={self.available_balance}, Total={self.total_balance}")
             

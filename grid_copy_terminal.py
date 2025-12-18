@@ -124,6 +124,17 @@ class GridCopyTerminal:
         # Pending actions queue (from WebSocket events)
         self.pending_actions: asyncio.Queue = None  # Will init in run()
         
+        # Priority 8: Event queue for batched processing
+        self.event_queue: Dict[str, Dict] = {}  # order_id -> latest event (deduplication)
+        self.event_queue_lock = asyncio.Lock() if asyncio else None
+        self.last_queue_process = 0
+        self.queue_process_interval = 0.05  # Process queue every 50ms
+        
+        # Priority 9: Verbose logging (separate from debug_mode)
+        # debug_mode = log errors and summaries
+        # verbose_mode = log everything (hot path details)
+        self.verbose_mode = False
+        
         # Stats
         self.orders_placed = 0
         self.orders_cancelled = 0
@@ -189,9 +200,14 @@ class GridCopyTerminal:
         self.console.print(f"[dim]Debug log: {log_file}[/dim]")
     
     def _debug_log(self, message: str):
-        """Write to debug log if enabled"""
+        """Write to debug log if enabled (errors and summaries)"""
         if self.debug_mode and self.debug_logger:
             self.debug_logger.info(message)
+    
+    def _verbose_log(self, message: str):
+        """Write verbose log if enabled (hot-path details)"""
+        if self.verbose_mode and self.debug_mode and self.debug_logger:
+            self.debug_logger.info(f"[V] {message}")
     
     async def setup(self):
         """Interactive setup wizard"""
@@ -505,7 +521,7 @@ class GridCopyTerminal:
             self.ws_connected = False
     
     async def _handle_order_event(self, message: Dict):
-        """Handle real-time order event from WebSocket"""
+        """Handle real-time order event from WebSocket - queues for batch processing"""
         try:
             # Extract order info from message
             order_info = message.get('order', {})
@@ -513,14 +529,69 @@ class GridCopyTerminal:
                 # Handle orders array
                 orders = message.get('orders', [])
                 for order in orders:
-                    await self._process_single_order_event(order)
+                    await self._queue_order_event(order)
                 return
             
             if order_info:
-                await self._process_single_order_event(order_info)
+                await self._queue_order_event(order_info)
                 
         except Exception as e:
-            self.log_activity("WS", "Error", str(e)[:40], "error")
+            self._debug_log(f"WS EVENT ERROR: {e}")
+    
+    async def _queue_order_event(self, order_info: Dict):
+        """Queue an order event for batched processing (Priority 8: deduplication)"""
+        coin = order_info.get('coin', '')
+        
+        # Filter to watched token only
+        if coin != self.watch_token:
+            return
+        
+        oid = str(order_info.get('oid', ''))
+        if not oid:
+            return
+        
+        # Queue event (deduplicate by order ID - keep latest)
+        async with self.event_queue_lock:
+            self.event_queue[oid] = {
+                'order_info': order_info,
+                'timestamp': time.time()
+            }
+        
+        self._verbose_log(f"Queued event for order {oid}")
+    
+    async def _process_event_queue(self):
+        """Process queued events in batch (Priority 8)"""
+        now = time.time()
+        
+        # Check if enough time has passed since last process
+        if now - self.last_queue_process < self.queue_process_interval:
+            return 0
+        
+        # Get all queued events
+        async with self.event_queue_lock:
+            if not self.event_queue:
+                return 0
+            
+            events_to_process = dict(self.event_queue)
+            self.event_queue.clear()
+        
+        self.last_queue_process = now
+        
+        if not events_to_process:
+            return 0
+        
+        self._debug_log(f"Processing {len(events_to_process)} queued events")
+        
+        # Process events
+        processed = 0
+        for oid, event_data in events_to_process.items():
+            try:
+                await self._process_single_order_event(event_data['order_info'])
+                processed += 1
+            except Exception as e:
+                self._debug_log(f"Event process error for {oid}: {e}")
+        
+        return processed
     
     async def _process_single_order_event(self, order_info: Dict):
         """Process a single order event"""
@@ -530,7 +601,7 @@ class GridCopyTerminal:
         if coin != self.watch_token:
             return
         
-        self._debug_log(f"WS ORDER EVENT: {order_info}")
+        self._verbose_log(f"WS ORDER EVENT: {order_info}")
         
         oid = str(order_info.get('oid', ''))
         side = order_info.get('side', '')  # 'B' or 'A'
@@ -538,7 +609,7 @@ class GridCopyTerminal:
         size = float(order_info.get('sz', 0) or order_info.get('origSz', 0))
         status = order_info.get('status', 'open')
         
-        self._debug_log(f"  Parsed: oid={oid}, side={side}, price={price}, size={size}, status={status}")
+        self._verbose_log(f"  Parsed: oid={oid}, side={side}, price={price}, size={size}, status={status}")
         
         # Normalize status
         if status in ['resting', 'open']:
@@ -558,17 +629,17 @@ class GridCopyTerminal:
             # New or updated order
             was_new = oid not in self.target_orders
             self.target_orders[oid] = order_record
-            self._debug_log(f"  Status=open, was_new={was_new}")
+            self._verbose_log(f"  Status=open, was_new={was_new}")
             
             if was_new and oid not in self.order_mapping:
                 # Check if we've hit max orders
                 if len(self.our_orders) >= self.config['max_open_orders']:
-                    self._debug_log(f"  Skipping: at max orders ({len(self.our_orders)})")
+                    self._verbose_log(f"  Skipping: at max orders ({len(self.our_orders)})")
                     return
                 
                 # Skip if margin-failed before
                 if oid in self.margin_failed_targets:
-                    self._debug_log(f"  Skipping: margin-failed previously")
+                    self._verbose_log(f"  Skipping: margin-failed previously")
                     return
                 
                 # Fetch balance before placing order
@@ -576,7 +647,7 @@ class GridCopyTerminal:
                 
                 # New order - place our matching order
                 our_size = self.calculate_our_size(size, price)
-                self._debug_log(f"  Calculated our_size={our_size}")
+                self._verbose_log(f"  Calculated our_size={our_size}")
                 
                 if our_size > 0:
                     our_order_id = await self.place_order(
@@ -596,6 +667,8 @@ class GridCopyTerminal:
                             'value': our_size * price,
                             'target_id': oid
                         }
+                        # Log summary (always)
+                        self._debug_log(f"PLACED: {order_record['side']} {our_size} {coin} @ ${price:.4f}")
                     else:
                         # Failed - mark for margin retry
                         self.margin_failed_targets.add(oid)
@@ -1156,9 +1229,9 @@ class GridCopyTerminal:
             initial_step = specs['step_size']
             initial_tick = specs['tick_size']
             
-            self._debug_log(f"PLACE ORDER: {coin} {side}")
-            self._debug_log(f"  Market: {market_name}")
-            self._debug_log(f"  Target price: {price}")
+            self._verbose_log(f"PLACE ORDER: {coin} {side}")
+            self._verbose_log(f"  Market: {market_name}")
+            self._verbose_log(f"  Target price: {price}")
             
             # Fetch orderbook and adjust price to ensure maker execution
             orderbook = await self._fetch_orderbook(market_name)
@@ -1171,10 +1244,10 @@ class GridCopyTerminal:
             )
             
             if price != original_price:
-                self._debug_log(f"  Adjusted price: {original_price} -> {price} (maker)")
+                self._verbose_log(f"  Adjusted price: {original_price} -> {price} (maker)")
             
-            self._debug_log(f"  Raw size: {size}, Final price: {price}")
-            self._debug_log(f"  Initial step: {initial_step}, Initial tick: {initial_tick}")
+            self._verbose_log(f"  Raw size: {size}, Final price: {price}")
+            self._verbose_log(f"  Initial step: {initial_step}, Initial tick: {initial_tick}")
             
             # Build list of step sizes to try
             step_sizes = [initial_step]
@@ -1191,7 +1264,7 @@ class GridCopyTerminal:
             step_sizes = list(dict.fromkeys(step_sizes))
             tick_sizes = list(dict.fromkeys(tick_sizes))
             
-            self._debug_log(f"  Will try step_sizes: {step_sizes[:6]}")
+            self._verbose_log(f"  Will try step_sizes: {step_sizes[:6]}")
             
             order_side = OrderSide.BUY if side == 'BUY' else OrderSide.SELL
             
@@ -1229,8 +1302,8 @@ class GridCopyTerminal:
                     if rounded_size <= 0:
                         continue
                     
-                    self._debug_log(f"  Attempt {attempts}: step={try_step}, tick={try_tick}")
-                    self._debug_log(f"    size={rounded_size} ({size_decimals} dec), price={rounded_price} ({price_decimals} dec)")
+                    self._verbose_log(f"  Attempt {attempts}: step={try_step}, tick={try_tick}")
+                    self._verbose_log(f"    size={rounded_size} ({size_decimals} dec), price={rounded_price} ({price_decimals} dec)")
                     
                     try:
                         # Try with post_only to ensure maker-only execution
@@ -1245,9 +1318,9 @@ class GridCopyTerminal:
                                 side=order_side,
                                 post_only=True,  # Maker only - reject if would take
                             )
-                            self._debug_log(f"    Method 1 (direct + post_only) succeeded")
+                            self._verbose_log(f"    Method 1 (direct + post_only) succeeded")
                         except TypeError as e:
-                            self._debug_log(f"    Method 1 failed: {e}")
+                            self._verbose_log(f"    Method 1 failed: {e}")
                             
                             # Method 2: orders module with post_only
                             try:
@@ -1259,9 +1332,9 @@ class GridCopyTerminal:
                                     price=str(rounded_price),
                                     post_only=True,
                                 )
-                                self._debug_log(f"    Method 2 (orders module + post_only) succeeded")
+                                self._verbose_log(f"    Method 2 (orders module + post_only) succeeded")
                             except TypeError as e2:
-                                self._debug_log(f"    Method 2 failed: {e2}")
+                                self._verbose_log(f"    Method 2 failed: {e2}")
                                 
                                 # Method 3: Direct client without post_only (fallback)
                                 result = await self.extended_client.place_order(
@@ -1270,9 +1343,9 @@ class GridCopyTerminal:
                                     price=Decimal(str(rounded_price)),
                                     side=order_side,
                                 )
-                                self._debug_log(f"    Method 3 (no post_only) - WARNING: may fill as taker")
+                                self._verbose_log(f"    Method 3 (no post_only) - WARNING: may fill as taker")
                         
-                        self._debug_log(f"    API Response: {result}")
+                        self._verbose_log(f"    API Response: {result}")
                         
                         if result:
                             order_id = None
@@ -1287,57 +1360,56 @@ class GridCopyTerminal:
                             if order_id:
                                 # Success! Save learned specs
                                 self._save_learned_specs(coin, try_step, try_tick)
-                                self._debug_log(f"  ✅ SUCCESS: Order {order_id} placed")
+                                self._verbose_log(f"  ✅ SUCCESS: Order {order_id} placed")
                                 self.orders_placed += 1
                                 self.log_activity("PLACE", coin, f"{side} {rounded_size} @ ${rounded_price:.4f}", "success")
                                 return order_id
                         
                         # Got response but no order_id - still might be success
                         self._save_learned_specs(coin, try_step, try_tick)
-                        self._debug_log(f"  ⚠ Response but no order_id")
+                        self._verbose_log(f"  ⚠ Response but no order_id")
                         return None
                         
                     except Exception as e:
                         error_msg = str(e)
-                        self._debug_log(f"    ❌ Full Error: {error_msg}")
+                        self._verbose_log(f"    ❌ Full Error: {error_msg}")
                         
                         # Check error type
                         if '1121' in error_msg or '1123' in error_msg:
                             # Quantity precision error - try next step size
-                            self._debug_log(f"    → Step {try_step} wrong, trying next...")
+                            self._verbose_log(f"    → Step {try_step} wrong, trying next...")
                             break  # Break inner loop, try next step_size
                         elif '1125' in error_msg:
                             # Price precision error - try next tick size
-                            self._debug_log(f"    → Tick {try_tick} wrong, trying next...")
+                            self._verbose_log(f"    → Tick {try_tick} wrong, trying next...")
                             continue  # Try next tick_size
                         elif '1111' in error_msg or 'post' in error_msg.lower() or 'would take' in error_msg.lower():
                             # Post-only order would have taken - price crossed spread
-                            self._debug_log(f"    → Post-only rejected (would take), skipping")
+                            self._verbose_log(f"    → Post-only rejected (would take), skipping")
                             self.log_activity("PLACE", coin, "Would take (spread)", "skip")
                             self.orders_rejected_postonly += 1
                             return None
                         elif '1140' in error_msg:
                             # Margin/balance error - don't retry until balance changes
-                            self._debug_log(f"    → Margin insufficient, need more balance")
+                            self._debug_log(f"Margin insufficient for {coin}")
                             self.log_activity("PLACE", coin, "Margin exceeded", "error")
                             self.orders_failed += 1
                             return None
                         else:
                             # Different error - log full details and stop retrying
-                            self._debug_log(f"    → Non-precision error code, stopping retries")
-                            self._debug_log(f"    → Error details: {repr(e)}")
+                            self._debug_log(f"API error for {coin}: {error_msg[:80]}")
                             self.log_activity("PLACE", coin, error_msg[:40], "error")
                             self.orders_failed += 1
                             return None
             
             # All attempts failed
-            self._debug_log(f"  ❌ All {attempts} attempts failed")
+            self._debug_log(f"All {attempts} precision attempts failed for {coin}")
             self.log_activity("PLACE", coin, f"Precision error after {attempts} tries", "error")
             self.orders_failed += 1
             return None
             
         except Exception as e:
-            self._debug_log(f"  EXCEPTION: {type(e).__name__}: {e}")
+            self._debug_log(f"PLACE EXCEPTION for {coin}: {type(e).__name__}: {e}")
             self.log_activity("PLACE", coin, str(e)[:40], "error")
             self.orders_failed += 1
             return None
@@ -1352,17 +1424,16 @@ class GridCopyTerminal:
                 self._debug_log(f"CANCEL FAILED: No market for {self.watch_token}")
                 return False
             
-            self._debug_log(f"CANCEL ORDER: {order_id} on {market_name}")
+            self._verbose_log(f"CANCEL ORDER: {order_id} on {market_name}")
             
-            # Debug: show available methods on orders module
-            if hasattr(self.extended_client, 'orders'):
+            # Debug: show available methods on orders module (only in verbose)
+            if self.verbose_mode and hasattr(self.extended_client, 'orders'):
                 methods = [m for m in dir(self.extended_client.orders) if not m.startswith('_')]
-                self._debug_log(f"  Available order methods: {methods}")
+                self._verbose_log(f"  Available order methods: {methods}")
                 
-                # Check cancel_order signature
                 if hasattr(self.extended_client.orders, 'cancel_order'):
                     sig = inspect.signature(self.extended_client.orders.cancel_order)
-                    self._debug_log(f"  cancel_order signature: {sig}")
+                    self._verbose_log(f"  cancel_order signature: {sig}")
             
             # Try different API signatures
             result = None
@@ -1370,58 +1441,57 @@ class GridCopyTerminal:
             # Method 1: Just order_id positional
             try:
                 result = await self.extended_client.orders.cancel_order(order_id)
-                self._debug_log(f"  Cancel method 1 (order_id positional) worked")
+                self._verbose_log(f"  Cancel method 1 worked")
             except TypeError as e:
-                self._debug_log(f"  Method 1 failed: {e}")
+                self._verbose_log(f"  Method 1 failed: {e}")
             
             # Method 2: order_id as kwarg only
             if result is None:
                 try:
                     result = await self.extended_client.orders.cancel_order(order_id=order_id)
-                    self._debug_log(f"  Cancel method 2 (order_id kwarg) worked")
+                    self._verbose_log(f"  Cancel method 2 worked")
                 except TypeError as e:
-                    self._debug_log(f"  Method 2 failed: {e}")
+                    self._verbose_log(f"  Method 2 failed: {e}")
             
             # Method 3: market_name, order_id positional
             if result is None:
                 try:
                     result = await self.extended_client.orders.cancel_order(market_name, order_id)
-                    self._debug_log(f"  Cancel method 3 (market, order_id positional) worked")
+                    self._verbose_log(f"  Cancel method 3 worked")
                 except TypeError as e:
-                    self._debug_log(f"  Method 3 failed: {e}")
+                    self._verbose_log(f"  Method 3 failed: {e}")
             
             # Method 4: id kwarg (some SDKs use 'id' not 'order_id')
             if result is None:
                 try:
                     result = await self.extended_client.orders.cancel_order(id=order_id)
-                    self._debug_log(f"  Cancel method 4 (id kwarg) worked")
+                    self._verbose_log(f"  Cancel method 4 worked")
                 except TypeError as e:
-                    self._debug_log(f"  Method 4 failed: {e}")
+                    self._verbose_log(f"  Method 4 failed: {e}")
             
             # Method 5: Cancel via main client
             if result is None and hasattr(self.extended_client, 'cancel_order'):
                 try:
                     result = await self.extended_client.cancel_order(order_id)
-                    self._debug_log(f"  Cancel method 5 (client.cancel_order) worked")
+                    self._verbose_log(f"  Cancel method 5 worked")
                 except (TypeError, AttributeError) as e:
-                    self._debug_log(f"  Method 5 failed: {e}")
+                    self._verbose_log(f"  Method 5 failed: {e}")
             
             # Method 6: cancel_all_orders for this market  
             if result is None and hasattr(self.extended_client.orders, 'cancel_all_orders'):
                 try:
-                    # This cancels ALL orders on market - use as last resort
-                    self._debug_log(f"  Trying cancel_all_orders for {market_name}...")
+                    self._verbose_log(f"  Trying cancel_all_orders for {market_name}...")
                     result = await self.extended_client.orders.cancel_all_orders(market_name)
-                    self._debug_log(f"  Cancel method 6 (cancel_all_orders) worked")
+                    self._verbose_log(f"  Cancel method 6 worked")
                 except (TypeError, AttributeError) as e:
-                    self._debug_log(f"  Method 6 failed: {e}")
+                    self._verbose_log(f"  Method 6 failed: {e}")
             
             if result is None:
-                self._debug_log(f"  All cancel methods failed!")
+                self._debug_log(f"Cancel failed for {order_id[:12]}...")
                 self.log_activity("CANCEL", self.watch_token, "All methods failed", "error")
                 return False
             
-            self._debug_log(f"  Cancel result: {result}")
+            self._verbose_log(f"  Cancel result: {result}")
             
             # Priority 4: Release estimated margin
             if order_id in self.our_orders:
@@ -2010,6 +2080,7 @@ class GridCopyTerminal:
         self.is_running = True
         self.start_time = time.time()
         self.pending_actions = asyncio.Queue()
+        self.event_queue_lock = asyncio.Lock()  # Initialize lock in async context
         
         # Fetch initial balance
         self.console.print("[dim]Checking balance...[/dim]")
@@ -2074,8 +2145,15 @@ class GridCopyTerminal:
                 self._debug_log("Live display started")
                 while self.is_running:
                     try:
-                        # REST sync as backup (every sync_interval seconds)
                         now = time.time()
+                        
+                        # Priority 8: Process queued WebSocket events (batched, deduped)
+                        try:
+                            await self._process_event_queue()
+                        except Exception as e:
+                            self._debug_log(f"QUEUE ERROR: {e}")
+                        
+                        # REST sync as backup (every sync_interval seconds)
                         if now - last_rest_sync >= self.sync_interval:
                             try:
                                 await self.sync_orders()
@@ -2126,8 +2204,9 @@ class GridCopyTerminal:
 
 
 async def main():
-    # Check for --debug flag
+    # Check for flags
     debug_flag = '--debug' in sys.argv or '-d' in sys.argv
+    verbose_flag = '--verbose' in sys.argv or '-v' in sys.argv
     
     terminal = GridCopyTerminal()
     
@@ -2135,6 +2214,12 @@ async def main():
     if debug_flag:
         terminal.debug_mode = True
         terminal.console.print("[yellow]Debug mode enabled via command line[/yellow]")
+    
+    # Override verbose mode if flag is passed (implies debug)
+    if verbose_flag:
+        terminal.debug_mode = True
+        terminal.verbose_mode = True
+        terminal.console.print("[yellow]Verbose mode enabled (detailed hot-path logging)[/yellow]")
     
     try:
         await terminal.run()

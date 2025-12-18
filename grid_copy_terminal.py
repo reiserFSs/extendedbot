@@ -173,12 +173,15 @@ class GridCopyTerminal:
         self.orders_skipped = 0  # Below min size
         self.orders_skipped_mirror = 0  # Filtered by position mirror
         self.orders_skipped_max_position = 0  # Filtered by max position limit
+        self.orders_skipped_range = 0  # Filtered by price range
+        self.orders_cancelled_drift = 0  # Cancelled due to price drift
         self.orders_failed = 0   # API errors
         self.orders_rejected_postonly = 0  # Post-only rejections (would have been taker)
         self.orders_rate_limited = 0  # Rate limit hits
         self.total_profit = 0.0
         self.start_time = None
         self.ws_messages_received = 0
+        self.last_cleanup_time = 0  # For periodic drift cleanup
         
         # Market info cache
         self.market_info_cache = {}
@@ -299,6 +302,12 @@ class GridCopyTerminal:
         self.console.print("[dim]Maximum position notional value in USD (0 = unlimited)[/dim]")
         self.console.print("[dim]When limit reached, only orders that REDUCE position are copied[/dim]")
         config['max_position_notional'] = float(input("Max Position $ (default 0=unlimited): ").strip() or "0")
+        
+        # Price range filter
+        self.console.print("\n[bold]Price Range Filter[/bold]")
+        self.console.print("[dim]Only copy orders within X% of current price (0 = disabled)[/dim]")
+        self.console.print("[dim]Frees margin by skipping far outer orders that rarely fill[/dim]")
+        config['order_price_range_percent'] = float(input("Price Range % (default 2.0, 0=disabled): ").strip() or "2.0")
         
         # Position mirror mode
         self.console.print("\n[bold]Position Mirror Mode[/bold]")
@@ -858,6 +867,121 @@ class GridCopyTerminal:
         # FLAT - allow all (shouldn't reach here if current_notional > 0)
         return True
     
+    def check_price_range(self, order_price: float) -> bool:
+        """
+        Check if order price is within the allowed range of current mid price.
+        
+        Args:
+            order_price: Price of the order
+        
+        Returns:
+            True if order is within range, False if too far from mid
+        """
+        range_percent = self.config.get('order_price_range_percent', 0)
+        
+        # If no range set, allow all
+        if range_percent <= 0:
+            return True
+        
+        # Get current mid price from orderbook
+        market_name = self._get_extended_market(self.watch_token)
+        if not market_name:
+            return True
+        
+        cached_ob = self.orderbook_cache.get(market_name, {})
+        best_bid = cached_ob.get('best_bid', 0)
+        best_ask = cached_ob.get('best_ask', 0)
+        
+        if best_bid <= 0 or best_ask <= 0:
+            return True  # No orderbook data, allow order
+        
+        mid_price = (best_bid + best_ask) / 2
+        
+        # Calculate distance from mid
+        distance_percent = abs(order_price - mid_price) / mid_price * 100
+        
+        if distance_percent > range_percent:
+            self._verbose_log(f"  Price range: ${order_price:.4f} is {distance_percent:.2f}% from mid ${mid_price:.4f} (limit: {range_percent}%)")
+            return False
+        
+        return True
+    
+    async def cleanup_drifted_orders(self):
+        """
+        Cancel our orders that have drifted too far from current price.
+        Called periodically to free up margin.
+        """
+        range_percent = self.config.get('order_price_range_percent', 0)
+        
+        # Skip if range filter disabled
+        if range_percent <= 0:
+            return 0
+        
+        # Get current mid price
+        market_name = self._get_extended_market(self.watch_token)
+        if not market_name:
+            return 0
+        
+        cached_ob = self.orderbook_cache.get(market_name, {})
+        best_bid = cached_ob.get('best_bid', 0)
+        best_ask = cached_ob.get('best_ask', 0)
+        
+        if best_bid <= 0 or best_ask <= 0:
+            return 0
+        
+        mid_price = (best_bid + best_ask) / 2
+        
+        # Find orders to cancel
+        orders_to_cancel = []
+        for order_id, order in list(self.our_orders.items()):
+            order_price = order.get('price', 0)
+            if order_price <= 0:
+                continue
+            
+            distance_percent = abs(order_price - mid_price) / mid_price * 100
+            
+            if distance_percent > range_percent:
+                orders_to_cancel.append({
+                    'order_id': order_id,
+                    'price': order_price,
+                    'distance': distance_percent
+                })
+        
+        if not orders_to_cancel:
+            return 0
+        
+        self._debug_log(f"DRIFT CLEANUP: Found {len(orders_to_cancel)} orders outside {range_percent}% range")
+        
+        # Cancel drifted orders
+        cancelled = 0
+        for order_info in orders_to_cancel:
+            order_id = order_info['order_id']
+            try:
+                success = await self.cancel_order(order_id)
+                if success:
+                    cancelled += 1
+                    self.orders_cancelled_drift += 1
+                    
+                    # Remove from tracking
+                    if order_id in self.our_orders:
+                        del self.our_orders[order_id]
+                    
+                    # Remove from mapping
+                    for target_id, our_id in list(self.order_mapping.items()):
+                        if our_id == order_id:
+                            del self.order_mapping[target_id]
+                            break
+                    
+                    self._verbose_log(f"  Cancelled drifted order @ ${order_info['price']:.4f} ({order_info['distance']:.1f}% from mid)")
+            except Exception as e:
+                self._debug_log(f"  Failed to cancel drifted order {order_id}: {e}")
+        
+        if cancelled > 0:
+            self.log_activity("CLEANUP", self.watch_token, f"Cancelled {cancelled} drifted orders", "info")
+            self._debug_log(f"DRIFT CLEANUP: Cancelled {cancelled}/{len(orders_to_cancel)} orders")
+        
+        return cancelled
+    
     async def _handle_order_event(self, message: Dict):
         """Handle real-time order event from WebSocket - queues for batch processing"""
         try:
@@ -990,6 +1114,12 @@ class GridCopyTerminal:
                 if not self.check_max_position(order_record['side'], price):
                     self._verbose_log(f"  Skipping: max position limit")
                     self.orders_skipped_max_position += 1
+                    return
+                
+                # Skip if outside price range
+                if not self.check_price_range(price):
+                    self._verbose_log(f"  Skipping: outside price range")
+                    self.orders_skipped_range += 1
                     return
                 
                 # Fetch balance before placing order
@@ -2426,6 +2556,7 @@ class GridCopyTerminal:
         skipped_margin = 0
         skipped_mirror = 0
         skipped_max_position = 0
+        skipped_range = 0
         
         # Clear margin failures if balance increased significantly (order filled = freed margin)
         if self.available_balance > self.last_balance_for_retry * 1.05:  # 5% increase
@@ -2452,6 +2583,11 @@ class GridCopyTerminal:
                     skipped_max_position += 1
                     continue
                 
+                # Skip if outside price range
+                if not self.check_price_range(target_order['price']):
+                    skipped_range += 1
+                    continue
+                
                 # Check if we've hit max orders
                 if len(self.our_orders) + len(orders_to_place) >= self.config['max_open_orders']:
                     skipped_max += 1
@@ -2469,11 +2605,12 @@ class GridCopyTerminal:
                 else:
                     skipped_size += 1
         
-        if skipped_max > 0 or skipped_size > 0 or skipped_margin > 0 or skipped_mirror > 0 or skipped_max_position > 0:
-            self._debug_log(f"SYNC: Skipped - max:{skipped_max}, size:{skipped_size}, margin:{skipped_margin}, mirror:{skipped_mirror}, maxpos:{skipped_max_position}")
+        if skipped_max > 0 or skipped_size > 0 or skipped_margin > 0 or skipped_mirror > 0 or skipped_max_position > 0 or skipped_range > 0:
+            self._debug_log(f"SYNC: Skipped - max:{skipped_max}, size:{skipped_size}, margin:{skipped_margin}, mirror:{skipped_mirror}, maxpos:{skipped_max_position}, range:{skipped_range}")
         
-        # Update global counter
+        # Update global counters
         self.orders_skipped_max_position += skipped_max_position
+        self.orders_skipped_range += skipped_range
         
         # Place orders (parallel or sequential)
         if orders_to_place:
@@ -2660,6 +2797,7 @@ class GridCopyTerminal:
         orders_to_place = []
         skipped_mirror = 0
         skipped_max_position = 0
+        skipped_range = 0
         for target_id, target_order in target_orders.items():
             if len(orders_to_place) >= self.config['max_open_orders']:
                 break
@@ -2672,6 +2810,11 @@ class GridCopyTerminal:
             # Skip if max position limit reached
             if not self.check_max_position(target_order['side'], target_order['price']):
                 skipped_max_position += 1
+                continue
+            
+            # Skip if outside price range
+            if not self.check_price_range(target_order['price']):
+                skipped_range += 1
                 continue
             
             our_size = self.calculate_our_size(target_order['size'], target_order['price'])
@@ -2689,6 +2832,10 @@ class GridCopyTerminal:
         if skipped_max_position > 0:
             self.console.print(f"[yellow]Skipped {skipped_max_position} orders (max position limit)[/yellow]")
             self.orders_skipped_max_position += skipped_max_position
+        
+        if skipped_range > 0:
+            self.console.print(f"[yellow]Skipped {skipped_range} orders (outside ±{self.config.get('order_price_range_percent', 0)}% range)[/yellow]")
+            self.orders_skipped_range += skipped_range
         
         if not orders_to_place:
             self.console.print("[yellow]No valid orders to place (check sizing config)[/yellow]")
@@ -2950,7 +3097,7 @@ class GridCopyTerminal:
         text.append(f"Fills Detected   ", style="white")
         text.append(f"{self.orders_filled}\n", style="green")
         
-        if self.orders_skipped > 0 or self.orders_skipped_mirror > 0 or self.orders_skipped_max_position > 0 or self.orders_failed > 0 or self.orders_rejected_postonly > 0 or self.orders_rate_limited > 0:
+        if self.orders_skipped > 0 or self.orders_skipped_mirror > 0 or self.orders_skipped_max_position > 0 or self.orders_skipped_range > 0 or self.orders_cancelled_drift > 0 or self.orders_failed > 0 or self.orders_rejected_postonly > 0 or self.orders_rate_limited > 0:
             text.append(f"\n", style="white")
             text.append(f"Skipped (size)   ", style="white")
             text.append(f"{self.orders_skipped}\n", style="dim")
@@ -2960,6 +3107,12 @@ class GridCopyTerminal:
             if self.orders_skipped_max_position > 0:
                 text.append(f"Skipped (maxpos) ", style="white")
                 text.append(f"{self.orders_skipped_max_position}\n", style="yellow")
+            if self.orders_skipped_range > 0:
+                text.append(f"Skipped (range)  ", style="white")
+                text.append(f"{self.orders_skipped_range}\n", style="yellow")
+            if self.orders_cancelled_drift > 0:
+                text.append(f"Cancelled (drift)", style="white")
+                text.append(f"{self.orders_cancelled_drift}\n", style="yellow")
             text.append(f"Failed (API)     ", style="white")
             text.append(f"{self.orders_failed}\n", style="red")
             text.append(f"Rejected (maker) ", style="white")
@@ -2980,6 +3133,23 @@ class GridCopyTerminal:
         if max_pos > 0:
             text.append(f"Max Position     ", style="white")
             text.append(f"${max_pos:.0f}\n", style="cyan")
+        
+        price_range = self.config.get('order_price_range_percent', 0)
+        if price_range > 0:
+            # Show the active price range
+            market_name = self._get_extended_market(self.watch_token)
+            cached_ob = self.orderbook_cache.get(market_name, {}) if market_name else {}
+            best_bid = cached_ob.get('best_bid', 0)
+            best_ask = cached_ob.get('best_ask', 0)
+            if best_bid > 0 and best_ask > 0:
+                mid = (best_bid + best_ask) / 2
+                low = mid * (1 - price_range / 100)
+                high = mid * (1 + price_range / 100)
+                text.append(f"Price Range      ", style="white")
+                text.append(f"±{price_range}% (${low:.4f}-${high:.4f})\n", style="cyan")
+            else:
+                text.append(f"Price Range      ", style="white")
+                text.append(f"±{price_range}%\n", style="cyan")
         
         fixed_size = self.config.get('fixed_order_size', 0)
         if fixed_size > 0:
@@ -3217,6 +3387,14 @@ class GridCopyTerminal:
                             await self.check_and_execute_take_profit()
                         except Exception as e:
                             self._debug_log(f"TAKE-PROFIT ERROR: {e}")
+                        
+                        # Periodic cleanup of drifted orders (every 30s)
+                        if now - self.last_cleanup_time >= 30.0:
+                            try:
+                                await self.cleanup_drifted_orders()
+                                self.last_cleanup_time = now
+                            except Exception as e:
+                                self._debug_log(f"CLEANUP ERROR: {e}")
                         
                         # Update display
                         layout["header"].update(self.render_header())

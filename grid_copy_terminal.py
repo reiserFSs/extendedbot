@@ -117,6 +117,8 @@ class GridCopyTerminal:
         self.orders_cancelled = 0
         self.orders_updated = 0
         self.orders_filled = 0
+        self.orders_skipped = 0  # Below min size
+        self.orders_failed = 0   # API errors
         self.total_profit = 0.0
         self.start_time = None
         self.ws_messages_received = 0
@@ -127,7 +129,7 @@ class GridCopyTerminal:
         
         # Sync timing
         self.last_sync = 0
-        self.sync_interval = 10.0  # REST sync every 10s as backup (WebSocket is primary)
+        self.sync_interval = 3.0  # REST sync every 3s for responsive grid following
         self.last_error = None
         
         # Activity log
@@ -217,6 +219,9 @@ class GridCopyTerminal:
         
         self.console.print("[dim]Max % of balance per order (prevents over-allocation)[/dim]")
         config['max_order_percent'] = float(input("Max Order % of Balance (default 10): ").strip() or "10")
+        
+        self.console.print("[dim]Fixed $ per order (0 = use % sizing, e.g. 22 = $22 per order)[/dim]")
+        config['fixed_order_size'] = float(input("Fixed Order Size USD (default 0): ").strip() or "0")
         
         self.console.print("[dim]Leverage multiplier (1-50, lower = safer)[/dim]")
         config['leverage'] = int(input("Leverage (default 1): ").strip() or "1")
@@ -800,32 +805,40 @@ class GridCopyTerminal:
             return self.available_balance  # Return cached value on error
     
     def calculate_our_size(self, target_size: float, price: float) -> float:
-        """Calculate our order size based on target's size and our available balance"""
+        """Calculate our order size based on target's size and our total balance"""
         target_value = target_size * price
         
-        # Check if we have any balance
-        if self.available_balance <= 0:
-            self._debug_log(f"SIZE CALC: No available balance (${self.available_balance:.2f}), skipping")
+        # Use TOTAL balance for sizing (not available) since margin is locked by open orders
+        # The API will reject if we truly exceed available margin
+        balance_for_sizing = max(self.total_balance, self.available_balance)
+        
+        if balance_for_sizing <= 0:
+            self._debug_log(f"SIZE CALC: No balance (${balance_for_sizing:.2f}), skipping")
             return 0
         
-        # Method 1: Proportional to target (size_percent)
-        scaled_value = target_value * self.config['size_percent']
-        
-        # Method 2: Cap at percentage of our available balance
-        max_order_pct = self.config.get('max_order_percent', 10)  # Default 10% of balance per order
-        balance_cap = self.available_balance * (max_order_pct / 100)
-        
-        # Use the smaller of the two
-        our_value = min(scaled_value, balance_cap)
-        
-        self._debug_log(f"SIZE CALC: avail_balance=${self.available_balance:.2f}, target_value=${target_value:.2f}")
-        self._debug_log(f"  scaled=${scaled_value:.2f} ({self.config['size_percent']*100:.3f}% of target)")
-        self._debug_log(f"  balance_cap=${balance_cap:.2f} ({max_order_pct}% of balance)")
-        self._debug_log(f"  final=${our_value:.2f}")
+        # Check if using fixed order size mode
+        fixed_order_size = self.config.get('fixed_order_size', 0)
+        if fixed_order_size > 0:
+            our_value = fixed_order_size
+            self._debug_log(f"SIZE CALC: Using fixed order size ${our_value:.2f}")
+        else:
+            # Method 1: Proportional to target (size_percent)
+            scaled_value = target_value * self.config['size_percent']
+            
+            # Method 2: Cap at percentage of total balance
+            max_order_pct = self.config.get('max_order_percent', 10)
+            balance_cap = balance_for_sizing * (max_order_pct / 100)
+            
+            # Use the smaller of the two
+            our_value = min(scaled_value, balance_cap)
+            
+            self._debug_log(f"SIZE CALC: balance=${balance_for_sizing:.2f}, target_value=${target_value:.2f}")
+            self._debug_log(f"  scaled=${scaled_value:.2f}, balance_cap=${balance_cap:.2f}, final=${our_value:.2f}")
         
         # Check minimum
         if our_value < self.config['min_order_value']:
             self._debug_log(f"SIZE CALC: ${our_value:.2f} < min ${self.config['min_order_value']}, skipping")
+            self.orders_skipped += 1
             return 0
         
         our_size = our_value / price
@@ -968,16 +981,19 @@ class GridCopyTerminal:
                             self._debug_log(f"    → Non-precision error code, stopping retries")
                             self._debug_log(f"    → Error details: {repr(e)}")
                             self.log_activity("PLACE", coin, error_msg[:40], "error")
+                            self.orders_failed += 1
                             return None
             
             # All attempts failed
             self._debug_log(f"  ❌ All {attempts} attempts failed")
             self.log_activity("PLACE", coin, f"Precision error after {attempts} tries", "error")
+            self.orders_failed += 1
             return None
             
         except Exception as e:
             self._debug_log(f"  EXCEPTION: {type(e).__name__}: {e}")
             self.log_activity("PLACE", coin, str(e)[:40], "error")
+            self.orders_failed += 1
             return None
     
     async def cancel_order(self, order_id: str) -> bool:
@@ -1249,6 +1265,9 @@ class GridCopyTerminal:
         text = Text()
         
         # Balance
+        text.append(f"Total Balance    ", style="white")
+        text.append(f"${self.total_balance:.2f}\n", style="cyan")
+        
         text.append(f"Available        ", style="white")
         if self.available_balance > 0:
             text.append(f"${self.available_balance:.2f}\n", style="green")
@@ -1291,6 +1310,13 @@ class GridCopyTerminal:
         text.append(f"Fills Detected   ", style="white")
         text.append(f"{self.orders_filled}\n", style="green")
         
+        if self.orders_skipped > 0 or self.orders_failed > 0:
+            text.append(f"\n", style="white")
+            text.append(f"Skipped (size)   ", style="white")
+            text.append(f"{self.orders_skipped}\n", style="dim")
+            text.append(f"Failed (API)     ", style="white")
+            text.append(f"{self.orders_failed}\n", style="red")
+        
         text.append(f"\n", style="white")
         
         text.append(f"Size Percent     ", style="white")
@@ -1298,6 +1324,11 @@ class GridCopyTerminal:
         
         text.append(f"Max Order %      ", style="white")
         text.append(f"{self.config.get('max_order_percent', 10)}%\n", style="white")
+        
+        fixed_size = self.config.get('fixed_order_size', 0)
+        if fixed_size > 0:
+            text.append(f"Fixed Order      ", style="white")
+            text.append(f"${fixed_size:.0f}\n", style="cyan")
         
         return Panel(text, title="Stats", border_style="green")
     

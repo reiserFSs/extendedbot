@@ -892,6 +892,8 @@ class GridCopyTerminal:
     
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel an order on Extended"""
+        import inspect
+        
         try:
             market_name = self._get_extended_market(self.watch_token)
             if not market_name:
@@ -900,10 +902,72 @@ class GridCopyTerminal:
             
             self._debug_log(f"CANCEL ORDER: {order_id} on {market_name}")
             
-            result = await self.extended_client.orders.cancel_order(
-                market=market_name,
-                order_id=order_id
-            )
+            # Debug: show available methods on orders module
+            if hasattr(self.extended_client, 'orders'):
+                methods = [m for m in dir(self.extended_client.orders) if not m.startswith('_')]
+                self._debug_log(f"  Available order methods: {methods}")
+                
+                # Check cancel_order signature
+                if hasattr(self.extended_client.orders, 'cancel_order'):
+                    sig = inspect.signature(self.extended_client.orders.cancel_order)
+                    self._debug_log(f"  cancel_order signature: {sig}")
+            
+            # Try different API signatures
+            result = None
+            
+            # Method 1: Just order_id positional
+            try:
+                result = await self.extended_client.orders.cancel_order(order_id)
+                self._debug_log(f"  Cancel method 1 (order_id positional) worked")
+            except TypeError as e:
+                self._debug_log(f"  Method 1 failed: {e}")
+            
+            # Method 2: order_id as kwarg only
+            if result is None:
+                try:
+                    result = await self.extended_client.orders.cancel_order(order_id=order_id)
+                    self._debug_log(f"  Cancel method 2 (order_id kwarg) worked")
+                except TypeError as e:
+                    self._debug_log(f"  Method 2 failed: {e}")
+            
+            # Method 3: market_name, order_id positional
+            if result is None:
+                try:
+                    result = await self.extended_client.orders.cancel_order(market_name, order_id)
+                    self._debug_log(f"  Cancel method 3 (market, order_id positional) worked")
+                except TypeError as e:
+                    self._debug_log(f"  Method 3 failed: {e}")
+            
+            # Method 4: id kwarg (some SDKs use 'id' not 'order_id')
+            if result is None:
+                try:
+                    result = await self.extended_client.orders.cancel_order(id=order_id)
+                    self._debug_log(f"  Cancel method 4 (id kwarg) worked")
+                except TypeError as e:
+                    self._debug_log(f"  Method 4 failed: {e}")
+            
+            # Method 5: Cancel via main client
+            if result is None and hasattr(self.extended_client, 'cancel_order'):
+                try:
+                    result = await self.extended_client.cancel_order(order_id)
+                    self._debug_log(f"  Cancel method 5 (client.cancel_order) worked")
+                except (TypeError, AttributeError) as e:
+                    self._debug_log(f"  Method 5 failed: {e}")
+            
+            # Method 6: cancel_all_orders for this market  
+            if result is None and hasattr(self.extended_client.orders, 'cancel_all_orders'):
+                try:
+                    # This cancels ALL orders on market - use as last resort
+                    self._debug_log(f"  Trying cancel_all_orders for {market_name}...")
+                    result = await self.extended_client.orders.cancel_all_orders(market_name)
+                    self._debug_log(f"  Cancel method 6 (cancel_all_orders) worked")
+                except (TypeError, AttributeError) as e:
+                    self._debug_log(f"  Method 6 failed: {e}")
+            
+            if result is None:
+                self._debug_log(f"  All cancel methods failed!")
+                self.log_activity("CANCEL", self.watch_token, "All methods failed", "error")
+                return False
             
             self._debug_log(f"  Cancel result: {result}")
             

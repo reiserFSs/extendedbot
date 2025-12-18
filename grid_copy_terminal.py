@@ -96,6 +96,7 @@ class GridCopyTerminal:
         self.is_running = False
         self.watch_token = None
         self.ws_connected = False
+        self.current_leverage = 1
         
         # Balance tracking
         self.available_balance = 0.0
@@ -216,6 +217,9 @@ class GridCopyTerminal:
         
         self.console.print("[dim]Max % of balance per order (prevents over-allocation)[/dim]")
         config['max_order_percent'] = float(input("Max Order % of Balance (default 10): ").strip() or "10")
+        
+        self.console.print("[dim]Leverage multiplier (1-50, lower = safer)[/dim]")
+        config['leverage'] = int(input("Leverage (default 1): ").strip() or "1")
         
         # Network
         config['use_testnet'] = input("Use Testnet? (y/N): ").strip().lower() == 'y'
@@ -351,12 +355,96 @@ class GridCopyTerminal:
             self.console.print(f"[red]✗ Extended error: {e}[/red]")
             return False
         
+        # Set leverage
+        target_leverage = self.config.get('leverage', 1)
+        await self._set_leverage(target_leverage)
+        
         # Set up Hyperliquid WebSocket for real-time order updates
         await self._setup_websocket()
         
         return True
     
-    async def _setup_websocket(self):
+    async def _set_leverage(self, leverage: int):
+        """Set leverage on Extended for the watched market"""
+        import inspect
+        
+        self.current_leverage = leverage
+        market_name = self._get_extended_market(self.watch_token) if self.watch_token else None
+        
+        self._debug_log(f"LEVERAGE: Attempting to set leverage to {leverage}x for {market_name}")
+        
+        # Try various methods to set leverage
+        try:
+            # Method 1: account.set_leverage
+            if hasattr(self.extended_client, 'account') and hasattr(self.extended_client.account, 'set_leverage'):
+                sig = inspect.signature(self.extended_client.account.set_leverage)
+                self._debug_log(f"  Found account.set_leverage with sig: {sig}")
+                try:
+                    result = await self.extended_client.account.set_leverage(leverage)
+                    self._debug_log(f"  account.set_leverage result: {result}")
+                    self.console.print(f"[green]✓ Leverage set to {leverage}x[/green]")
+                    return True
+                except Exception as e:
+                    self._debug_log(f"  account.set_leverage failed: {e}")
+            
+            # Method 2: account.set_leverage with market
+            if hasattr(self.extended_client, 'account') and hasattr(self.extended_client.account, 'set_leverage'):
+                try:
+                    result = await self.extended_client.account.set_leverage(market_name, leverage)
+                    self._debug_log(f"  account.set_leverage(market, leverage) result: {result}")
+                    self.console.print(f"[green]✓ Leverage set to {leverage}x[/green]")
+                    return True
+                except Exception as e:
+                    self._debug_log(f"  account.set_leverage(market, leverage) failed: {e}")
+            
+            # Method 3: set_leverage on main client
+            if hasattr(self.extended_client, 'set_leverage'):
+                sig = inspect.signature(self.extended_client.set_leverage)
+                self._debug_log(f"  Found client.set_leverage with sig: {sig}")
+                try:
+                    result = await self.extended_client.set_leverage(leverage)
+                    self._debug_log(f"  client.set_leverage result: {result}")
+                    self.console.print(f"[green]✓ Leverage set to {leverage}x[/green]")
+                    return True
+                except Exception as e:
+                    self._debug_log(f"  client.set_leverage failed: {e}")
+            
+            # Method 4: update_leverage
+            if hasattr(self.extended_client, 'account') and hasattr(self.extended_client.account, 'update_leverage'):
+                try:
+                    result = await self.extended_client.account.update_leverage(market_name, leverage)
+                    self._debug_log(f"  account.update_leverage result: {result}")
+                    self.console.print(f"[green]✓ Leverage set to {leverage}x[/green]")
+                    return True
+                except Exception as e:
+                    self._debug_log(f"  account.update_leverage failed: {e}")
+            
+            # Method 5: change_leverage
+            if hasattr(self.extended_client, 'change_leverage'):
+                try:
+                    result = await self.extended_client.change_leverage(market_name, leverage)
+                    self._debug_log(f"  change_leverage result: {result}")
+                    self.console.print(f"[green]✓ Leverage set to {leverage}x[/green]")
+                    return True
+                except Exception as e:
+                    self._debug_log(f"  change_leverage failed: {e}")
+            
+            # List available methods for debugging
+            if hasattr(self.extended_client, 'account'):
+                methods = [m for m in dir(self.extended_client.account) if not m.startswith('_')]
+                self._debug_log(f"  Available account methods: {methods}")
+            
+            client_methods = [m for m in dir(self.extended_client) if not m.startswith('_')]
+            self._debug_log(f"  Available client methods: {client_methods}")
+            
+            self.console.print(f"[yellow]⚠ Could not set leverage - using account default[/yellow]")
+            self.console.print(f"[dim]Target leverage: {leverage}x - check Extended UI to set manually[/dim]")
+            return False
+            
+        except Exception as e:
+            self._debug_log(f"LEVERAGE ERROR: {e}")
+            self.console.print(f"[yellow]⚠ Leverage setting failed: {e}[/yellow]")
+            return False
         """Set up WebSocket connection to Hyperliquid for real-time order updates"""
         try:
             base_url = constants.MAINNET_API_URL
@@ -1164,6 +1252,10 @@ class GridCopyTerminal:
             text.append(f"${self.available_balance:.2f}\n", style="green")
         else:
             text.append(f"${self.available_balance:.2f}\n", style="red")
+        
+        # Leverage
+        text.append(f"Leverage         ", style="white")
+        text.append(f"{self.current_leverage}x\n", style="cyan")
         
         # WebSocket status
         text.append(f"WebSocket        ", style="white")

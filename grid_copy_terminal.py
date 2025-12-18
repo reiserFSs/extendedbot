@@ -1514,9 +1514,8 @@ class GridCopyTerminal:
         if tp_threshold <= 0:
             return False
         
-        # If TP is pending, check if position closed (to confirm realized PnL)
+        # If TP is already pending (being processed), skip
         if self.take_profit_pending:
-            await self._check_tp_fill_status()
             return False
         
         # Update PnL locally using orderbook (fast, every loop iteration)
@@ -1559,27 +1558,6 @@ class GridCopyTerminal:
         
         return False
     
-    async def _check_tp_fill_status(self):
-        """Check if take-profit order filled by comparing position size"""
-        # Force fresh position fetch
-        self.last_position_fetch = 0
-        await self.fetch_position()
-        
-        current_size = abs(self.current_position['size'])
-        
-        # If position closed or significantly reduced, TP filled
-        if current_size < self.pre_tp_position_size * 0.1:  # 90%+ reduction
-            # Confirmed fill - count realized PnL
-            self.total_realized_pnl += self.pending_tp_profit
-            self._debug_log(f"TAKE-PROFIT FILLED: Realized ${self.pending_tp_profit:.2f}, Total: ${self.total_realized_pnl:.2f}")
-            self.log_activity("TP", self.watch_token, f"Filled +${self.pending_tp_profit:.2f}", "success")
-            
-            # Reset pending state
-            self.pending_tp_profit = 0.0
-            self.pre_tp_position_size = 0.0
-            self.take_profit_pending = False
-            self.take_profit_order_id = None
-    
     async def place_take_profit_order(self, position: Dict) -> bool:
         """Place a limit order to close the entire position at current price (with retry)"""
         try:
@@ -1608,76 +1586,155 @@ class GridCopyTerminal:
             self._debug_log(f"TAKE-PROFIT ORDER: {close_side} {size} (closing {position['side']})")
             self._debug_log(f"  Entry was ${entry_price:.4f}, expected profit: ${position['unrealized_pnl']:.2f}")
             
-            # Retry with backoff for rate limits
-            max_retries = 3
-            for attempt in range(max_retries):
-                # Refresh price on each attempt
-                cached_ob = self.orderbook_cache.get(market_name, {})
-                if position['side'] == 'LONG':
-                    close_price = cached_ob.get('best_bid', entry_price * 1.005)
-                else:
-                    close_price = cached_ob.get('best_ask', entry_price * 0.995)
+            # Get current orderbook
+            cached_ob = self.orderbook_cache.get(market_name, {})
+            best_bid = cached_ob.get('best_bid', 0)
+            best_ask = cached_ob.get('best_ask', 0)
+            
+            # Step 1: Try limit order at best price (maker, 0% fee)
+            if close_side == 'SELL':
+                limit_price = best_bid if best_bid > 0 else entry_price * 1.005
+            else:
+                limit_price = best_ask if best_ask > 0 else entry_price * 0.995
+            
+            self._debug_log(f"  Step 1: Limit order @ ${limit_price:.4f}")
+            
+            order_id = await self.place_order(
+                coin=self.watch_token,
+                side=close_side,
+                size=size,
+                price=limit_price
+            )
+            
+            if not order_id:
+                self._debug_log(f"  Limit order failed, trying market directly...")
+            else:
+                self.take_profit_order_id = order_id
+                self.log_activity("TP", self.watch_token, f"Limit {close_side} @ ${limit_price:.4f}", "pending")
                 
-                self._debug_log(f"  Attempt {attempt + 1}/{max_retries} @ ${close_price:.4f}")
+                # Step 2: Wait briefly for fill (2 seconds)
+                await asyncio.sleep(2.0)
                 
-                # Place the order
-                order_id = await self.place_order(
-                    coin=self.watch_token,
-                    side=close_side,
-                    size=size,
-                    price=close_price
-                )
+                # Step 3: Check if position closed
+                self.last_position_fetch = 0  # Force refresh
+                await self.fetch_position()
                 
-                if order_id:
-                    self.take_profit_order_id = order_id
-                    # Don't count realized PnL yet - wait for fill confirmation in _check_tp_fill_status
-                    self.log_activity("TP", self.watch_token, 
-                        f"{close_side} {size:.4f} @ ${close_price:.4f}", "pending")
-                    self._debug_log(f"TAKE-PROFIT PLACED: Order {order_id} (awaiting fill)")
-                    
-                    # Keep take_profit_pending = True, _check_tp_fill_status will verify fill
-                    # Start timeout task as fallback
-                    asyncio.create_task(self._clear_take_profit_pending())
+                current_size = abs(self.current_position.get('size', 0))
+                if current_size < size * 0.1:  # 90%+ reduction = filled
+                    self._debug_log(f"  Limit order FILLED! Position closed.")
+                    self.total_realized_pnl += self.pending_tp_profit
+                    self.log_activity("TP", self.watch_token, f"Filled +${self.pending_tp_profit:.2f}", "success")
+                    self._reset_tp_state()
+                    return True
+                
+                # Step 4: Not filled → Cancel limit order
+                self._debug_log(f"  Limit not filled (size still {current_size:.4f}), cancelling...")
+                try:
+                    await self.cancel_order(order_id)
+                except Exception as e:
+                    self._debug_log(f"  Cancel error (may already be filled): {e}")
+                
+                # Check again after cancel (might have filled during cancel)
+                await asyncio.sleep(0.5)
+                self.last_position_fetch = 0
+                await self.fetch_position()
+                current_size = abs(self.current_position.get('size', 0))
+                if current_size < size * 0.1:
+                    self._debug_log(f"  Filled during cancel!")
+                    self.total_realized_pnl += self.pending_tp_profit
+                    self.log_activity("TP", self.watch_token, f"Filled +${self.pending_tp_profit:.2f}", "success")
+                    self._reset_tp_state()
+                    return True
+            
+            # Step 5: Market order (cross the spread, guaranteed fill)
+            # Refresh orderbook
+            cached_ob = self.orderbook_cache.get(market_name, {})
+            best_bid = cached_ob.get('best_bid', 0)
+            best_ask = cached_ob.get('best_ask', 0)
+            
+            if close_side == 'SELL':
+                # Sell into bids - use bid price with small buffer below
+                market_price = best_bid * 0.999 if best_bid > 0 else entry_price * 0.995
+            else:
+                # Buy into asks - use ask price with small buffer above
+                market_price = best_ask * 1.001 if best_ask > 0 else entry_price * 1.005
+            
+            self._debug_log(f"  Step 5: Market order @ ${market_price:.4f} (crossing spread)")
+            self.log_activity("TP", self.watch_token, f"Market {close_side} @ ${market_price:.4f}", "pending")
+            
+            # Remaining size (might have partially filled)
+            remaining_size = abs(self.current_position.get('size', size))
+            if remaining_size < 0.0001:
+                remaining_size = size  # Use original if position shows 0
+            
+            market_order_id = await self.place_order(
+                coin=self.watch_token,
+                side=close_side,
+                size=remaining_size,
+                price=market_price
+            )
+            
+            if market_order_id:
+                self.take_profit_order_id = market_order_id
+                
+                # Wait for market order to fill
+                await asyncio.sleep(1.0)
+                
+                # Verify fill
+                self.last_position_fetch = 0
+                await self.fetch_position()
+                current_size = abs(self.current_position.get('size', 0))
+                
+                if current_size < remaining_size * 0.1:
+                    self._debug_log(f"  Market order FILLED!")
+                    self.total_realized_pnl += self.pending_tp_profit
+                    self.log_activity("TP", self.watch_token, f"Filled +${self.pending_tp_profit:.2f}", "success")
+                    self._reset_tp_state()
                     return True
                 else:
-                    # Order failed - wait and retry
-                    if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
-                        self._debug_log(f"  Take-profit failed, retrying in {wait_time}s...")
-                        await asyncio.sleep(wait_time)
-            
-            # All retries failed
-            self.take_profit_pending = False
-            self.log_activity("TP", self.watch_token, "Order failed after retries", "error")
-            return False
+                    self._debug_log(f"  Market order may not have filled completely (size: {current_size})")
+                    # Start background check
+                    asyncio.create_task(self._verify_tp_fill_background())
+                    return True
+            else:
+                self._debug_log(f"  Market order FAILED")
+                self.log_activity("TP", self.watch_token, "Market order failed", "error")
+                self._reset_tp_state()
+                return False
                 
         except Exception as e:
             self._debug_log(f"TAKE-PROFIT ERROR: {e}")
-            self.take_profit_pending = False
+            self._reset_tp_state()
             return False
     
-    async def _clear_take_profit_pending(self):
-        """Clear take-profit pending flag after timeout and cancel unfilled order"""
-        await asyncio.sleep(30.0)  # Wait for fill verification to catch it
-        if self.take_profit_pending:
-            self._debug_log(f"TAKE-PROFIT TIMEOUT: Order not filled, cancelling...")
-            
-            # Cancel the unfilled TP order
-            if self.take_profit_order_id:
-                try:
-                    await self.cancel_order(self.take_profit_order_id)
-                    self.log_activity("TP", self.watch_token, "Cancelled (unfilled)", "skip")
-                    self._debug_log(f"TAKE-PROFIT CANCELLED: {self.take_profit_order_id}")
-                except Exception as e:
-                    self._debug_log(f"TAKE-PROFIT CANCEL ERROR: {e}")
-            
-            # Reset pending state
-            self.take_profit_pending = False
-            self.take_profit_order_id = None
-            self.pending_tp_profit = 0.0
-            self.pre_tp_position_size = 0.0
-            # Force position refresh
-            self.last_position_fetch = 0
+    def _reset_tp_state(self):
+        """Reset take-profit state variables"""
+        self.take_profit_pending = False
+        self.take_profit_order_id = None
+        self.pending_tp_profit = 0.0
+        self.pre_tp_position_size = 0.0
+        self.last_position_fetch = 0
+    
+    async def _verify_tp_fill_background(self):
+        """Background task to verify TP fill after a few seconds"""
+        await asyncio.sleep(5.0)
+        
+        if not self.take_profit_pending:
+            return
+        
+        self.last_position_fetch = 0
+        await self.fetch_position()
+        
+        current_size = abs(self.current_position.get('size', 0))
+        if current_size < self.pre_tp_position_size * 0.1:
+            self._debug_log(f"  Background check: TP FILLED!")
+            self.total_realized_pnl += self.pending_tp_profit
+            self.log_activity("TP", self.watch_token, f"Confirmed +${self.pending_tp_profit:.2f}", "success")
+        else:
+            self._debug_log(f"  Background check: Position still open ({current_size})")
+            self.log_activity("TP", self.watch_token, f"May not have filled", "warning")
+        
+        self._reset_tp_state()
     
     def calculate_our_size(self, target_size: float, price: float) -> float:
         """Calculate our order size based on target's size and our total balance"""

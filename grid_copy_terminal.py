@@ -16,6 +16,7 @@ import time
 import json
 import sys
 import logging
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -657,8 +658,19 @@ class GridCopyTerminal:
         our_size = our_value / price
         return our_size
     
+    def _save_learned_specs(self, coin: str, step_size: float, tick_size: float):
+        """Save successfully learned market specs for future use"""
+        self.precision_cache[coin] = {
+            'step_size': step_size,
+            'tick_size': tick_size,
+            'size_decimals': max(0, -int(round(math.log10(step_size)))) if step_size > 0 else 2,
+            'price_decimals': max(0, -int(round(math.log10(tick_size)))) if tick_size > 0 else 4,
+            'learned': True
+        }
+        self._debug_log(f"💾 Saved learned specs for {coin}: step={step_size}, tick={tick_size}")
+    
     async def place_order(self, coin: str, side: str, size: float, price: float) -> Optional[str]:
-        """Place a limit order on Extended"""
+        """Place a limit order on Extended with automatic precision learning"""
         try:
             market_name = self._get_extended_market(coin)
             if not market_name:
@@ -666,84 +678,132 @@ class GridCopyTerminal:
                 self.log_activity("PLACE", coin, f"Market not found", "error")
                 return None
             
-            # Get precision
+            # Get initial precision specs
             specs = await self._get_precision_specs(coin)
-            step_size = specs['step_size']
-            tick_size = specs['tick_size']
+            initial_step = specs['step_size']
+            initial_tick = specs['tick_size']
             
             self._debug_log(f"PLACE ORDER: {coin} {side}")
             self._debug_log(f"  Market: {market_name}")
             self._debug_log(f"  Raw size: {size}, Raw price: {price}")
-            self._debug_log(f"  Step size: {step_size}, Tick size: {tick_size}")
+            self._debug_log(f"  Initial step: {initial_step}, Initial tick: {initial_tick}")
             
-            # Round size and price
-            rounded_size = round(size / step_size) * step_size
-            rounded_price = round(price / tick_size) * tick_size
+            # Build list of step sizes to try
+            step_sizes = [initial_step]
+            if initial_step < 1:
+                step_sizes.extend([1, 0.1, 0.01, 0.001, 10, 100])
+            else:
+                step_sizes.extend([1, 10, 0.1, 100, 0.01])
             
-            self._debug_log(f"  Rounded size: {rounded_size}, Rounded price: {rounded_price}")
+            # Build list of tick sizes to try
+            tick_sizes = [initial_tick]
+            tick_sizes.extend([0.0001, 0.001, 0.01, 0.00001, 0.1])
             
-            if rounded_size <= 0:
-                self._debug_log(f"  SKIP: Size {size} rounds to {rounded_size} (below minimum)")
-                self.log_activity("PLACE", coin, f"Size too small: {size:.6f}", "skip")
-                return None
+            # Remove duplicates
+            step_sizes = list(dict.fromkeys(step_sizes))
+            tick_sizes = list(dict.fromkeys(tick_sizes))
             
-            # Place order using direct client method
+            self._debug_log(f"  Will try step_sizes: {step_sizes[:6]}")
+            
             order_side = OrderSide.BUY if side == 'BUY' else OrderSide.SELL
             
-            self._debug_log(f"  Calling extended_client.place_order()...")
-            self._debug_log(f"    market_name={market_name}")
-            self._debug_log(f"    amount_of_synthetic={Decimal(str(rounded_size))}")
-            self._debug_log(f"    price={Decimal(str(rounded_price))}")
-            self._debug_log(f"    side={order_side}")
+            attempts = 0
+            max_attempts = 10
             
-            result = await self.extended_client.place_order(
-                market_name=market_name,
-                amount_of_synthetic=Decimal(str(rounded_size)),
-                price=Decimal(str(rounded_price)),
-                side=order_side,
-            )
+            for try_step in step_sizes[:6]:
+                for try_tick in tick_sizes[:3]:
+                    if attempts >= max_attempts:
+                        break
+                    attempts += 1
+                    
+                    # Round size and price
+                    rounded_size = round(size / try_step) * try_step
+                    rounded_price = round(price / try_tick) * try_tick
+                    
+                    # Calculate decimal places
+                    if try_step >= 1:
+                        size_decimals = 0
+                    elif try_step >= 0.1:
+                        size_decimals = 1
+                    elif try_step >= 0.01:
+                        size_decimals = 2
+                    elif try_step >= 0.001:
+                        size_decimals = 3
+                    else:
+                        size_decimals = 4
+                    
+                    price_decimals = max(0, -int(round(math.log10(try_tick)))) if try_tick > 0 else 4
+                    
+                    # Format with correct decimals
+                    rounded_size = round(rounded_size, size_decimals)
+                    rounded_price = round(rounded_price, price_decimals)
+                    
+                    if rounded_size <= 0:
+                        continue
+                    
+                    self._debug_log(f"  Attempt {attempts}: step={try_step}, tick={try_tick}")
+                    self._debug_log(f"    size={rounded_size} ({size_decimals} dec), price={rounded_price} ({price_decimals} dec)")
+                    
+                    try:
+                        result = await self.extended_client.place_order(
+                            market_name=market_name,
+                            amount_of_synthetic=Decimal(str(rounded_size)),
+                            price=Decimal(str(rounded_price)),
+                            side=order_side,
+                        )
+                        
+                        self._debug_log(f"    API Response: {result}")
+                        
+                        if result:
+                            order_id = None
+                            if hasattr(result, 'id') and result.id:
+                                order_id = str(result.id)
+                            elif hasattr(result, 'order_id') and result.order_id:
+                                order_id = str(result.order_id)
+                            elif hasattr(result, 'data') and result.data:
+                                if hasattr(result.data, 'id'):
+                                    order_id = str(result.data.id)
+                            
+                            if order_id:
+                                # Success! Save learned specs
+                                self._save_learned_specs(coin, try_step, try_tick)
+                                self._debug_log(f"  ✅ SUCCESS: Order {order_id} placed")
+                                self.orders_placed += 1
+                                self.log_activity("PLACE", coin, f"{side} {rounded_size} @ ${rounded_price:.4f}", "success")
+                                return order_id
+                        
+                        # Got response but no order_id - still might be success
+                        self._save_learned_specs(coin, try_step, try_tick)
+                        self._debug_log(f"  ⚠ Response but no order_id")
+                        return None
+                        
+                    except Exception as e:
+                        error_msg = str(e)
+                        self._debug_log(f"    ❌ Error: {error_msg[:100]}")
+                        
+                        # Check error type
+                        if '1121' in error_msg or '1123' in error_msg:
+                            # Quantity precision error - try next step size
+                            self._debug_log(f"    → Step {try_step} wrong, trying next...")
+                            break  # Break inner loop, try next step_size
+                        elif '1125' in error_msg:
+                            # Price precision error - try next tick size
+                            self._debug_log(f"    → Tick {try_tick} wrong, trying next...")
+                            continue  # Try next tick_size
+                        else:
+                            # Different error - stop retrying
+                            self._debug_log(f"    → Non-precision error, stopping")
+                            self.log_activity("PLACE", coin, error_msg[:40], "error")
+                            return None
             
-            self._debug_log(f"  API Response: {result}")
-            self._debug_log(f"  Response type: {type(result)}")
-            
-            if result:
-                # Log all attributes of result
-                if hasattr(result, '__dict__'):
-                    self._debug_log(f"  Response attrs: {result.__dict__}")
-                
-                order_id = None
-                if hasattr(result, 'id') and result.id:
-                    order_id = str(result.id)
-                    self._debug_log(f"  Found order_id via .id: {order_id}")
-                elif hasattr(result, 'order_id') and result.order_id:
-                    order_id = str(result.order_id)
-                    self._debug_log(f"  Found order_id via .order_id: {order_id}")
-                elif hasattr(result, 'data') and result.data:
-                    self._debug_log(f"  Result has .data: {result.data}")
-                    if hasattr(result.data, 'id'):
-                        order_id = str(result.data.id)
-                        self._debug_log(f"  Found order_id via .data.id: {order_id}")
-                
-                if order_id:
-                    self._debug_log(f"  SUCCESS: Order placed, id={order_id}")
-                    self.orders_placed += 1
-                    self.log_activity("PLACE", coin, f"{side} {rounded_size:.4f} @ ${rounded_price:.4f}", "success")
-                    return order_id
-            
-            self._debug_log(f"  FAILED: No order ID in response")
-            self.log_activity("PLACE", coin, "No order ID returned", "error")
+            # All attempts failed
+            self._debug_log(f"  ❌ All {attempts} attempts failed")
+            self.log_activity("PLACE", coin, f"Precision error after {attempts} tries", "error")
             return None
             
         except Exception as e:
-            error_msg = str(e)
-            self._debug_log(f"  EXCEPTION: {type(e).__name__}: {error_msg}")
-            self._debug_log(f"  Full exception: {repr(e)}")
-            
-            # Check for common errors
-            if "1123" in error_msg or "precision" in error_msg.lower():
-                self.log_activity("PLACE", coin, "Precision error", "error")
-            else:
-                self.log_activity("PLACE", coin, error_msg[:50], "error")
+            self._debug_log(f"  EXCEPTION: {type(e).__name__}: {e}")
+            self.log_activity("PLACE", coin, str(e)[:40], "error")
             return None
     
     async def cancel_order(self, order_id: str) -> bool:

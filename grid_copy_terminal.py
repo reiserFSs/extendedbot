@@ -152,12 +152,24 @@ class GridCopyTerminal:
         self.pre_tp_position_size = 0.0     # Position size before TP order (to detect close)
         self.total_realized_pnl = 0.0       # Track cumulative CONFIRMED profit
         
+        # Target position tracking (from Hyperliquid WebSocket)
+        self.target_position: Dict = {
+            'size': 0.0,        # Negative = short, Positive = long
+            'side': None,       # 'LONG', 'SHORT', or None
+            'entry_price': 0.0,
+            'unrealized_pnl': 0.0,
+        }
+        self.position_mirror_enabled = False  # Set from config
+        self.copy_side_mode = "BOTH"          # "BUY", "SELL", or "BOTH"
+        self.orders_filtered_by_mirror = 0    # Count of orders skipped due to mirror mode
+        
         # Stats
         self.orders_placed = 0
         self.orders_cancelled = 0
         self.orders_updated = 0
         self.orders_filled = 0
         self.orders_skipped = 0  # Below min size
+        self.orders_skipped_mirror = 0  # Filtered by position mirror
         self.orders_failed = 0   # API errors
         self.orders_rejected_postonly = 0  # Post-only rejections (would have been taker)
         self.orders_rate_limited = 0  # Rate limit hits
@@ -279,6 +291,12 @@ class GridCopyTerminal:
         self.console.print("[dim]Recommended: 0.4-0.5% to cover fees and lock profit[/dim]")
         config['take_profit_percent'] = float(input("Take-Profit % (default 0.5): ").strip() or "0.5")
         
+        # Position mirror mode
+        self.console.print("\n[bold]Position Mirror Mode[/bold]")
+        self.console.print("[dim]Mirror target's position direction via WebSocket[/dim]")
+        self.console.print("[dim]If target is SHORT, only copy SELL orders (and vice versa)[/dim]")
+        config['position_mirror'] = input("Enable Position Mirror? (y/N): ").strip().lower() == 'y'
+        
         # Network
         config['use_testnet'] = input("Use Testnet? (y/N): ").strip().lower() == 'y'
         
@@ -305,6 +323,11 @@ class GridCopyTerminal:
         
         if self.debug_mode and not self.debug_logger:
             self._setup_debug_logger()
+        
+        # Set up position mirror mode
+        self.position_mirror_enabled = self.config.get('position_mirror', False)
+        if self.position_mirror_enabled:
+            self.console.print("[cyan]Position mirror mode enabled[/cyan]")
         
         self.console.print(f"\n[green]Will copy {self.watch_token} orders from target[/green]")
         return True
@@ -516,7 +539,7 @@ class GridCopyTerminal:
             main_loop = asyncio.get_running_loop()
             
             def handle_ws_message(message):
-                """Handle incoming WebSocket messages"""
+                """Handle incoming WebSocket messages for orders"""
                 self.ws_connected = True
                 self.ws_messages_received += 1
                 
@@ -531,11 +554,26 @@ class GridCopyTerminal:
                     except Exception as e:
                         pass  # Don't crash on callback errors
             
-            # Subscribe to target wallet's userEvents
+            def handle_webdata2_message(message):
+                """Handle incoming WebSocket messages for target position (webData2)"""
+                try:
+                    self._process_target_position(message)
+                except Exception as e:
+                    self._debug_log(f"webData2 error: {e}")
+            
+            # Subscribe to target wallet's userEvents (orders)
             self.ws_info.subscribe(
                 {"type": "userEvents", "user": self.config['target_wallet']},
                 handle_ws_message
             )
+            
+            # Subscribe to target wallet's webData2 (positions) if mirror mode enabled
+            if self.position_mirror_enabled:
+                self.ws_info.subscribe(
+                    {"type": "webData2", "user": self.config['target_wallet']},
+                    handle_webdata2_message
+                )
+                self.console.print("[green]✓ Position mirror WebSocket connected[/green]")
             
             self.ws_connected = True
             self.console.print("[green]✓ WebSocket connected (real-time updates)[/green]")
@@ -543,6 +581,147 @@ class GridCopyTerminal:
         except Exception as e:
             self.console.print(f"[yellow]⚠ WebSocket error: {e} - using polling[/yellow]")
             self.ws_connected = False
+    
+    def _process_target_position(self, message: Dict):
+        """Process target's position from webData2 WebSocket message"""
+        try:
+            # Extract clearinghouse state from webData2
+            data = message.get('data', message)
+            
+            # Handle different message structures
+            clearinghouse = None
+            if isinstance(data, dict):
+                clearinghouse = data.get('clearinghouseState', data)
+            
+            if not clearinghouse:
+                return
+            
+            # Get asset positions
+            positions = clearinghouse.get('assetPositions', [])
+            
+            for pos_data in positions:
+                pos = pos_data.get('position', pos_data)
+                coin = pos.get('coin', '')
+                
+                # Only track our watched token
+                if coin != self.watch_token:
+                    continue
+                
+                # Parse position data
+                size_str = pos.get('szi', '0')
+                size = float(size_str) if size_str else 0.0
+                entry_price = float(pos.get('entryPx', 0) or 0)
+                unrealized_pnl = float(pos.get('unrealizedPnl', 0) or 0)
+                
+                # Update target position
+                old_side = self.target_position['side']
+                self.target_position = {
+                    'size': size,
+                    'side': 'LONG' if size > 0 else ('SHORT' if size < 0 else None),
+                    'entry_price': entry_price,
+                    'unrealized_pnl': unrealized_pnl,
+                }
+                
+                # Update copy side mode based on target position
+                old_mode = self.copy_side_mode
+                if size > 0:
+                    # Target is LONG → copy BUY orders to also go long
+                    self.copy_side_mode = "BUY"
+                elif size < 0:
+                    # Target is SHORT → copy SELL orders to also go short
+                    self.copy_side_mode = "SELL"
+                else:
+                    # Target is FLAT → copy both sides
+                    self.copy_side_mode = "BOTH"
+                
+                # Log if mode changed
+                if old_mode != self.copy_side_mode:
+                    self._debug_log(f"TARGET POSITION CHANGED: {old_side} -> {self.target_position['side']}")
+                    self._debug_log(f"COPY MODE CHANGED: {old_mode} -> {self.copy_side_mode}")
+                    self.log_activity("MIRROR", self.watch_token, 
+                        f"Target {self.target_position['side'] or 'FLAT'} → copy {self.copy_side_mode}", "info")
+                
+                break  # Found our token
+                
+        except Exception as e:
+            self._debug_log(f"TARGET POSITION ERROR: {e}")
+    
+    async def fetch_target_position_rest(self):
+        """Fetch target's position via REST API (for initial sync before WebSocket)"""
+        if not self.position_mirror_enabled:
+            return
+        
+        try:
+            # Use Hyperliquid REST API
+            url = "https://api.hyperliquid.xyz/info"
+            payload = {
+                "type": "clearinghouseState",
+                "user": self.config['target_wallet']
+            }
+            
+            async with self.http_session.post(url, json=payload) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    # Parse positions
+                    positions = data.get('assetPositions', [])
+                    for pos_data in positions:
+                        pos = pos_data.get('position', pos_data)
+                        coin = pos.get('coin', '')
+                        
+                        if coin != self.watch_token:
+                            continue
+                        
+                        size_str = pos.get('szi', '0')
+                        size = float(size_str) if size_str else 0.0
+                        entry_price = float(pos.get('entryPx', 0) or 0)
+                        unrealized_pnl = float(pos.get('unrealizedPnl', 0) or 0)
+                        
+                        self.target_position = {
+                            'size': size,
+                            'side': 'LONG' if size > 0 else ('SHORT' if size < 0 else None),
+                            'entry_price': entry_price,
+                            'unrealized_pnl': unrealized_pnl,
+                        }
+                        
+                        # Update copy mode
+                        if size > 0:
+                            self.copy_side_mode = "BUY"
+                        elif size < 0:
+                            self.copy_side_mode = "SELL"
+                        else:
+                            self.copy_side_mode = "BOTH"
+                        
+                        self._debug_log(f"TARGET POSITION (REST): {self.target_position}")
+                        self._debug_log(f"COPY MODE: {self.copy_side_mode}")
+                        
+                        self.console.print(f"[cyan]Target position: {self.target_position['side'] or 'FLAT'} {abs(size):.2f} {self.watch_token}[/cyan]")
+                        self.console.print(f"[cyan]Copy mode: {self.copy_side_mode} only[/cyan]")
+                        break
+                else:
+                    self._debug_log(f"TARGET POSITION REST ERROR: HTTP {response.status}")
+                    
+        except Exception as e:
+            self._debug_log(f"TARGET POSITION REST ERROR: {e}")
+            self.console.print(f"[yellow]⚠ Could not fetch target position: {e}[/yellow]")
+    
+    def should_copy_order(self, order_side: str) -> bool:
+        """
+        Check if an order should be copied based on position mirror settings.
+        
+        Args:
+            order_side: 'BUY' or 'SELL'
+        
+        Returns:
+            True if order should be copied, False if filtered out
+        """
+        if not self.position_mirror_enabled:
+            return True
+        
+        if self.copy_side_mode == "BOTH":
+            return True
+        
+        return order_side == self.copy_side_mode
     
     async def _handle_order_event(self, message: Dict):
         """Handle real-time order event from WebSocket - queues for batch processing"""
@@ -664,6 +843,12 @@ class GridCopyTerminal:
                 # Skip if margin-failed before
                 if oid in self.margin_failed_targets:
                     self._verbose_log(f"  Skipping: margin-failed previously")
+                    return
+                
+                # Skip if filtered by position mirror
+                if not self.should_copy_order(order_record['side']):
+                    self._verbose_log(f"  Skipping: mirror filter ({self.copy_side_mode} only)")
+                    self.orders_skipped_mirror += 1
                     return
                 
                 # Fetch balance before placing order
@@ -1937,6 +2122,7 @@ class GridCopyTerminal:
         skipped_max = 0
         skipped_size = 0
         skipped_margin = 0
+        skipped_mirror = 0
         
         # Clear margin failures if balance increased significantly (order filled = freed margin)
         if self.available_balance > self.last_balance_for_retry * 1.05:  # 5% increase
@@ -1951,6 +2137,11 @@ class GridCopyTerminal:
                 # Skip if previously failed due to margin
                 if target_id in self.margin_failed_targets:
                     skipped_margin += 1
+                    continue
+                
+                # Skip if filtered by position mirror
+                if not self.should_copy_order(target_order['side']):
+                    skipped_mirror += 1
                     continue
                 
                 # Check if we've hit max orders
@@ -1970,8 +2161,8 @@ class GridCopyTerminal:
                 else:
                     skipped_size += 1
         
-        if skipped_max > 0 or skipped_size > 0 or skipped_margin > 0:
-            self._debug_log(f"SYNC: Skipped - max:{skipped_max}, size:{skipped_size}, margin:{skipped_margin}")
+        if skipped_max > 0 or skipped_size > 0 or skipped_margin > 0 or skipped_mirror > 0:
+            self._debug_log(f"SYNC: Skipped - max:{skipped_max}, size:{skipped_size}, margin:{skipped_margin}, mirror:{skipped_mirror}")
         
         # Place orders (parallel or sequential)
         if orders_to_place:
@@ -2156,9 +2347,15 @@ class GridCopyTerminal:
         
         # Collect orders to place
         orders_to_place = []
+        skipped_mirror = 0
         for target_id, target_order in target_orders.items():
             if len(orders_to_place) >= self.config['max_open_orders']:
                 break
+            
+            # Skip if filtered by position mirror
+            if not self.should_copy_order(target_order['side']):
+                skipped_mirror += 1
+                continue
             
             our_size = self.calculate_our_size(target_order['size'], target_order['price'])
             if our_size > 0:
@@ -2167,6 +2364,10 @@ class GridCopyTerminal:
                     'target_order': target_order,
                     'our_size': our_size
                 })
+        
+        if skipped_mirror > 0:
+            self.console.print(f"[yellow]Skipped {skipped_mirror} orders (mirror mode: {self.copy_side_mode} only)[/yellow]")
+            self.orders_skipped_mirror += skipped_mirror
         
         if not orders_to_place:
             self.console.print("[yellow]No valid orders to place (check sizing config)[/yellow]")
@@ -2265,10 +2466,37 @@ class GridCopyTerminal:
         text.append(f"Leverage         ", style="white")
         text.append(f"{self.current_leverage}x\n", style="cyan")
         
-        # Position info
+        # Target position and mirror mode (if enabled)
+        if self.position_mirror_enabled:
+            text.append(f"\n", style="white")
+            text.append(f"═══ Target ═══\n", style="dim")
+            
+            target = self.target_position
+            if target['side']:
+                text.append(f"Position         ", style="white")
+                target_color = "green" if target['side'] == 'LONG' else "red"
+                text.append(f"{target['side']} ", style=target_color)
+                text.append(f"{abs(target['size']):.2f}\n", style="cyan")
+            else:
+                text.append(f"Position         ", style="white")
+                text.append(f"FLAT\n", style="dim")
+            
+            text.append(f"Copy Mode        ", style="white")
+            if self.copy_side_mode == "BOTH":
+                text.append(f"ALL\n", style="cyan")
+            else:
+                mode_color = "green" if self.copy_side_mode == "BUY" else "red"
+                text.append(f"{self.copy_side_mode} only\n", style=mode_color)
+            
+            if self.orders_skipped_mirror > 0:
+                text.append(f"Filtered         ", style="white")
+                text.append(f"{self.orders_skipped_mirror} orders\n", style="yellow")
+        
+        # Our position info
         pos = self.current_position
         if pos['side']:
             text.append(f"\n", style="white")
+            text.append(f"═══ Our Position ═══\n", style="dim")
             text.append(f"Position         ", style="white")
             side_color = "green" if pos['side'] == 'LONG' else "red"
             text.append(f"{pos['side']} ", style=side_color)
@@ -2365,10 +2593,13 @@ class GridCopyTerminal:
         text.append(f"Fills Detected   ", style="white")
         text.append(f"{self.orders_filled}\n", style="green")
         
-        if self.orders_skipped > 0 or self.orders_failed > 0 or self.orders_rejected_postonly > 0 or self.orders_rate_limited > 0:
+        if self.orders_skipped > 0 or self.orders_skipped_mirror > 0 or self.orders_failed > 0 or self.orders_rejected_postonly > 0 or self.orders_rate_limited > 0:
             text.append(f"\n", style="white")
             text.append(f"Skipped (size)   ", style="white")
             text.append(f"{self.orders_skipped}\n", style="dim")
+            if self.orders_skipped_mirror > 0:
+                text.append(f"Skipped (mirror) ", style="white")
+                text.append(f"{self.orders_skipped_mirror}\n", style="yellow")
             text.append(f"Failed (API)     ", style="white")
             text.append(f"{self.orders_failed}\n", style="red")
             text.append(f"Rejected (maker) ", style="white")
@@ -2543,6 +2774,11 @@ class GridCopyTerminal:
             self.console.print(f"[yellow]⚠ Low balance: ${self.available_balance:.2f} (min order: ${self.config['min_order_value']})[/yellow]")
         else:
             self.console.print(f"[green]✓ Available balance: ${self.available_balance:.2f}[/green]")
+        
+        # Fetch target position before placing orders (if mirror mode enabled)
+        if self.position_mirror_enabled:
+            self.console.print("[dim]Fetching target position...[/dim]")
+            await self.fetch_target_position_rest()
         
         # Pre-fetch and place entire grid at startup (FAST - parallel placement)
         try:

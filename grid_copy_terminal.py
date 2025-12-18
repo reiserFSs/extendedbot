@@ -879,59 +879,124 @@ class GridCopyTerminal:
         self._debug_log(f"💾 Saved learned specs for {coin}: step={step_size}, tick={tick_size}")
     
     async def _fetch_orderbook(self, market_name: str) -> Dict:
-        """Get orderbook from cache (updated by WebSocket stream)."""
+        """Get orderbook from cache (updated by WebSocket stream), with REST fallback."""
         if market_name in self.orderbook_cache:
             cached = self.orderbook_cache[market_name]
             return {'best_bid': cached['best_bid'], 'best_ask': cached['best_ask']}
         
+        # Cache miss and no WebSocket - try REST API fallback
+        if not self.orderbook_ws_connected:
+            return await self._fetch_orderbook_rest(market_name)
+        
         # No cache yet - return zeros, WebSocket will populate
         return {'best_bid': 0, 'best_ask': 0}
+    
+    async def _fetch_orderbook_rest(self, market_name: str) -> Dict:
+        """Fallback: fetch orderbook via REST API"""
+        try:
+            # Try Extended SDK methods
+            if hasattr(self.extended_client, 'markets_info'):
+                markets = await self.extended_client.markets_info.get_markets(market_names=[market_name])
+                if markets and markets.data:
+                    md = markets.data[0]
+                    best_bid = float(getattr(md, 'best_bid', 0) or getattr(md, 'bid_price', 0) or 0)
+                    best_ask = float(getattr(md, 'best_ask', 0) or getattr(md, 'ask_price', 0) or 0)
+                    
+                    if best_bid == 0 and best_ask == 0:
+                        # Fallback to index price
+                        index_price = float(getattr(md, 'index_price', 0) or 0)
+                        if index_price > 0:
+                            best_bid = index_price
+                            best_ask = index_price
+                    
+                    if best_bid > 0 or best_ask > 0:
+                        self.orderbook_cache[market_name] = {
+                            'best_bid': best_bid,
+                            'best_ask': best_ask,
+                            'timestamp': time.time()
+                        }
+                        return {'best_bid': best_bid, 'best_ask': best_ask}
+            
+            return {'best_bid': 0, 'best_ask': 0}
+            
+        except Exception as e:
+            self._debug_log(f"ORDERBOOK REST ERROR: {e}")
+            return {'best_bid': 0, 'best_ask': 0}
     
     async def _start_orderbook_websocket(self, market_name: str):
         """Start WebSocket stream for real-time orderbook updates (10ms best bid/ask)"""
         
-        # Use depth=1 for best bid/ask only (10ms updates)
-        ws_url = f"wss://api.starknet.extended.exchange/v1/orderbooks/{market_name}?depth=1"
-        self._debug_log(f"ORDERBOOK WS: Connecting to {ws_url}")
+        # Try different URL formats
+        urls_to_try = [
+            # Format 1: With stream.extended.exchange path prefix
+            f"wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks/{market_name}?depth=1",
+            # Format 2: Without market (all markets)
+            f"wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks?depth=1",
+            # Format 3: Direct path
+            f"wss://api.starknet.extended.exchange/v1/orderbooks/{market_name}?depth=1",
+        ]
         
-        try:
-            async with aiohttp.ClientSession() as session:
-                # heartbeat=10 handles ping/pong automatically (server pings every 15s, expects pong within 10s)
-                async with session.ws_connect(ws_url, heartbeat=10) as ws:
-                    self.orderbook_ws = ws
-                    self.orderbook_ws_connected = True
-                    self._debug_log(f"ORDERBOOK WS: Connected")
-                    
-                    async for msg in ws:
-                        if not self.is_running:
-                            break
-                            
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            try:
-                                data = json.loads(msg.data)
-                                self._process_orderbook_message(market_name, data)
-                            except json.JSONDecodeError:
-                                pass
-                        elif msg.type == aiohttp.WSMsgType.PING:
-                            await ws.pong(msg.data)
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            self._debug_log(f"ORDERBOOK WS ERROR: {ws.exception()}")
-                            break
-                        elif msg.type == aiohttp.WSMsgType.CLOSED:
-                            self._debug_log(f"ORDERBOOK WS: Closed")
-                            break
-                    
-        except Exception as e:
-            self._debug_log(f"ORDERBOOK WS EXCEPTION: {e}")
-        finally:
-            self.orderbook_ws_connected = False
-            self.orderbook_ws = None
+        for ws_url in urls_to_try:
+            self._debug_log(f"ORDERBOOK WS: Trying {ws_url}")
+            
+            try:
+                async with aiohttp.ClientSession() as session:
+                    # heartbeat=10 handles ping/pong automatically
+                    async with session.ws_connect(ws_url, heartbeat=10) as ws:
+                        self.orderbook_ws = ws
+                        self.orderbook_ws_connected = True
+                        self._debug_log(f"ORDERBOOK WS: Connected to {ws_url}")
+                        
+                        async for msg in ws:
+                            if not self.is_running:
+                                break
+                                
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data = json.loads(msg.data)
+                                    # If subscribing to all markets, filter for our market
+                                    self._process_orderbook_message(market_name, data)
+                                except json.JSONDecodeError:
+                                    pass
+                            elif msg.type == aiohttp.WSMsgType.PING:
+                                await ws.pong(msg.data)
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                self._debug_log(f"ORDERBOOK WS ERROR: {ws.exception()}")
+                                break
+                            elif msg.type == aiohttp.WSMsgType.CLOSED:
+                                self._debug_log(f"ORDERBOOK WS: Closed")
+                                break
+                        
+                        # If we got here, connection worked - return to reconnect loop
+                        return
+                        
+            except Exception as e:
+                self._debug_log(f"ORDERBOOK WS EXCEPTION for {ws_url}: {e}")
+                continue  # Try next URL
+        
+        # All URLs failed
+        self._debug_log("ORDERBOOK WS: All URL formats failed")
+        self.orderbook_ws_connected = False
+        self.orderbook_ws = None
     
     def _process_orderbook_message(self, market_name: str, data: dict):
         """Process orderbook WebSocket message and update cache"""
         try:
+            # Log first message for debugging
+            if not self.orderbook_cache:
+                self._debug_log(f"ORDERBOOK FIRST MSG: {json.dumps(data)[:500]}")
+            
             # Handle wrapped format: {type, ts, data: {m, t, b, a}, seq}
             ob_data = data.get('data', data)
+            
+            # Check if this is for our market (data.m is market name)
+            msg_market = ob_data.get('m', '')
+            if msg_market and msg_market != market_name:
+                # Message is for a different market, ignore
+                return
+            
+            # Use the message market or our target market
+            actual_market = msg_market or market_name
             
             bids = ob_data.get('b', [])
             asks = ob_data.get('a', [])
@@ -948,26 +1013,40 @@ class GridCopyTerminal:
                 best_ask = float(asks[0].get('p', 0))
             
             if best_bid > 0 or best_ask > 0:
-                self.orderbook_cache[market_name] = {
+                self.orderbook_cache[actual_market] = {
                     'best_bid': best_bid,
                     'best_ask': best_ask,
                     'timestamp': time.time()
                 }
+                # Also store under our expected market name if different
+                if actual_market != market_name:
+                    self.orderbook_cache[market_name] = self.orderbook_cache[actual_market]
                 
         except Exception as e:
             self._debug_log(f"ORDERBOOK PARSE ERROR: {e}")
     
     async def _orderbook_websocket_loop(self, market_name: str):
-        """Maintain orderbook WebSocket connection with auto-reconnect"""
+        """Maintain orderbook WebSocket connection with auto-reconnect and REST fallback"""
+        ws_fail_count = 0
+        max_ws_failures = 5  # After this many failures, use REST polling
+        
         while self.is_running:
             try:
                 await self._start_orderbook_websocket(market_name)
+                ws_fail_count = 0  # Reset on successful connection
             except Exception as e:
                 self._debug_log(f"ORDERBOOK WS LOOP ERROR: {e}")
+                ws_fail_count += 1
             
             if self.is_running:
-                self._debug_log("ORDERBOOK WS: Reconnecting in 1s...")
-                await asyncio.sleep(1.0)
+                if ws_fail_count >= max_ws_failures:
+                    # Fall back to REST polling
+                    self._debug_log(f"ORDERBOOK: WS failed {ws_fail_count} times, using REST fallback")
+                    await self._fetch_orderbook_rest(market_name)
+                    await asyncio.sleep(2.0)  # Poll every 2s via REST
+                else:
+                    self._debug_log("ORDERBOOK WS: Reconnecting in 1s...")
+                    await asyncio.sleep(1.0)
     
     def _adjust_price_for_maker(self, price: float, side: str, best_bid: float, best_ask: float, tick_size: float) -> float:
         """
@@ -1539,14 +1618,17 @@ class GridCopyTerminal:
         
         # Orderbook WebSocket status
         text.append(f"Orderbook        ", style="white")
+        cached = self.orderbook_cache.get(self._get_extended_market(self.watch_token) or '', {})
+        bid = cached.get('best_bid', 0)
+        ask = cached.get('best_ask', 0)
+        
         if self.orderbook_ws_connected:
-            cached = self.orderbook_cache.get(self._get_extended_market(self.watch_token) or '', {})
-            bid = cached.get('best_bid', 0)
-            ask = cached.get('best_ask', 0)
             if bid > 0:
                 text.append(f"${bid:.4f}/${ask:.4f}\n", style="green")
             else:
-                text.append(f"Connected\n", style="green")
+                text.append(f"WS Connected\n", style="green")
+        elif bid > 0:
+            text.append(f"${bid:.4f}/${ask:.4f} (REST)\n", style="yellow")
         else:
             text.append(f"Connecting...\n", style="yellow")
         

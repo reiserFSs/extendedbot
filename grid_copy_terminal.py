@@ -121,6 +121,7 @@ class GridCopyTerminal:
         self.orders_filled = 0
         self.orders_skipped = 0  # Below min size
         self.orders_failed = 0   # API errors
+        self.orders_rejected_postonly = 0  # Post-only rejections (would have been taker)
         self.total_profit = 0.0
         self.start_time = None
         self.ws_messages_received = 0
@@ -947,12 +948,44 @@ class GridCopyTerminal:
                     self._debug_log(f"    size={rounded_size} ({size_decimals} dec), price={rounded_price} ({price_decimals} dec)")
                     
                     try:
-                        result = await self.extended_client.place_order(
-                            market_name=market_name,
-                            amount_of_synthetic=Decimal(str(rounded_size)),
-                            price=Decimal(str(rounded_price)),
-                            side=order_side,
-                        )
+                        # Try with post_only to ensure maker-only execution
+                        result = None
+                        
+                        # Method 1: Direct client with post_only
+                        try:
+                            result = await self.extended_client.place_order(
+                                market_name=market_name,
+                                amount_of_synthetic=Decimal(str(rounded_size)),
+                                price=Decimal(str(rounded_price)),
+                                side=order_side,
+                                post_only=True,  # Maker only - reject if would take
+                            )
+                            self._debug_log(f"    Method 1 (direct + post_only) succeeded")
+                        except TypeError as e:
+                            self._debug_log(f"    Method 1 failed: {e}")
+                            
+                            # Method 2: orders module with post_only
+                            try:
+                                side_str = 'BUY' if side == 'BUY' else 'SELL'
+                                result = await self.extended_client.orders.place_order(
+                                    market=market_name,
+                                    side=side_str,
+                                    size=str(rounded_size),
+                                    price=str(rounded_price),
+                                    post_only=True,
+                                )
+                                self._debug_log(f"    Method 2 (orders module + post_only) succeeded")
+                            except TypeError as e2:
+                                self._debug_log(f"    Method 2 failed: {e2}")
+                                
+                                # Method 3: Direct client without post_only (fallback)
+                                result = await self.extended_client.place_order(
+                                    market_name=market_name,
+                                    amount_of_synthetic=Decimal(str(rounded_size)),
+                                    price=Decimal(str(rounded_price)),
+                                    side=order_side,
+                                )
+                                self._debug_log(f"    Method 3 (no post_only) - WARNING: may fill as taker")
                         
                         self._debug_log(f"    API Response: {result}")
                         
@@ -992,6 +1025,12 @@ class GridCopyTerminal:
                             # Price precision error - try next tick size
                             self._debug_log(f"    → Tick {try_tick} wrong, trying next...")
                             continue  # Try next tick_size
+                        elif '1111' in error_msg or 'post' in error_msg.lower() or 'would take' in error_msg.lower():
+                            # Post-only order would have taken - price crossed spread
+                            self._debug_log(f"    → Post-only rejected (would take), skipping")
+                            self.log_activity("PLACE", coin, "Would take (spread)", "skip")
+                            self.orders_rejected_postonly += 1
+                            return None
                         elif '1140' in error_msg:
                             # Margin/balance error - don't retry until balance changes
                             self._debug_log(f"    → Margin insufficient, need more balance")
@@ -1378,12 +1417,14 @@ class GridCopyTerminal:
         text.append(f"Fills Detected   ", style="white")
         text.append(f"{self.orders_filled}\n", style="green")
         
-        if self.orders_skipped > 0 or self.orders_failed > 0:
+        if self.orders_skipped > 0 or self.orders_failed > 0 or self.orders_rejected_postonly > 0:
             text.append(f"\n", style="white")
             text.append(f"Skipped (size)   ", style="white")
             text.append(f"{self.orders_skipped}\n", style="dim")
             text.append(f"Failed (API)     ", style="white")
             text.append(f"{self.orders_failed}\n", style="red")
+            text.append(f"Rejected (maker) ", style="white")
+            text.append(f"{self.orders_rejected_postonly}\n", style="yellow")
         
         text.append(f"\n", style="white")
         

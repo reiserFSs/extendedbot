@@ -99,11 +99,15 @@ class GridCopyTerminal:
         self.ws_connected = False
         self.current_leverage = 1
         
-        # Balance tracking
+        # Balance tracking (Priority 4: with local estimation)
         self.available_balance = 0.0
         self.total_balance = 0.0
+        self.estimated_margin_used = 0.0  # Track estimated margin from our orders
         self.last_balance_fetch = 0
-        self.balance_fetch_interval = 5.0  # Refresh balance every 5s
+        self.balance_fetch_interval = 10.0  # Refresh balance every 10s (rely on estimation between fetches)
+        
+        # HTTP session for connection pooling (Priority 6)
+        self.http_session: Optional[aiohttp.ClientSession] = None
         
         # Order tracking
         self.target_orders: Dict[str, Dict] = {}  # order_id -> order_info
@@ -138,7 +142,7 @@ class GridCopyTerminal:
         
         # Sync timing
         self.last_sync = 0
-        self.sync_interval = 3.0  # REST sync every 3s for responsive grid following
+        self.sync_interval = 1.0  # REST sync every 1s for responsive grid following
         self.last_error = None
         
         # Activity log
@@ -783,9 +787,11 @@ class GridCopyTerminal:
         """Fetch available balance from Extended"""
         try:
             now = time.time()
-            # Use cached balance if recent enough
+            # Use cached balance if recent enough (rely on estimation between fetches)
             if now - self.last_balance_fetch < self.balance_fetch_interval and self.available_balance > 0:
-                return self.available_balance
+                # Return estimated available = total - estimated_margin_used
+                estimated_available = self.total_balance - self.estimated_margin_used
+                return max(0, estimated_available)
             
             balance = await self.extended_client.account.get_balance()
             self._debug_log(f"BALANCE: Raw response: {balance}")
@@ -819,6 +825,9 @@ class GridCopyTerminal:
                     self.available_balance = float(balance.get('available_for_trade', balance.get('available', balance.get('free', 0))))
                 
                 self._debug_log(f"BALANCE: Available={self.available_balance}, Total={self.total_balance}")
+                
+                # Reset margin estimation on fresh API fetch (API is source of truth)
+                self.estimated_margin_used = self.total_balance - self.available_balance
             
             self.last_balance_fetch = now
             return self.available_balance
@@ -1414,6 +1423,12 @@ class GridCopyTerminal:
             
             self._debug_log(f"  Cancel result: {result}")
             
+            # Priority 4: Release estimated margin
+            if order_id in self.our_orders:
+                order = self.our_orders[order_id]
+                estimated_margin = order.get('value', 0) / self.current_leverage
+                self.estimated_margin_used = max(0, self.estimated_margin_used - estimated_margin)
+            
             self.orders_cancelled += 1
             self.log_activity("CANCEL", self.watch_token, f"Order {order_id[:8]}...", "success")
             return True
@@ -1566,6 +1581,7 @@ class GridCopyTerminal:
         target_id = order_info['target_id']
         target_order = order_info['target_order']
         our_size = order_info['our_size']
+        order_value = our_size * target_order['price']
         
         our_order_id = await self.place_order(
             coin=target_order['coin'],
@@ -1582,9 +1598,12 @@ class GridCopyTerminal:
                 'side': target_order['side'],
                 'size': our_size,
                 'price': target_order['price'],
-                'value': our_size * target_order['price'],
+                'value': order_value,
                 'target_id': target_id
             }
+            # Priority 4: Track estimated margin used
+            estimated_margin = order_value / self.current_leverage
+            self.estimated_margin_used += estimated_margin
             return True
         else:
             self.margin_failed_targets.add(target_id)
@@ -1755,10 +1774,15 @@ class GridCopyTerminal:
         text.append(f"${self.total_balance:.2f}\n", style="cyan")
         
         text.append(f"Available        ", style="white")
-        if self.available_balance > 0:
-            text.append(f"${self.available_balance:.2f}\n", style="green")
+        estimated_available = self.total_balance - self.estimated_margin_used
+        if estimated_available > 0:
+            text.append(f"${estimated_available:.2f}\n", style="green")
         else:
-            text.append(f"${self.available_balance:.2f}\n", style="red")
+            text.append(f"${estimated_available:.2f}\n", style="red")
+        
+        # Margin used (estimated)
+        text.append(f"Margin Used      ", style="white")
+        text.append(f"${self.estimated_margin_used:.2f}\n", style="dim")
         
         # Leverage
         text.append(f"Leverage         ", style="white")
@@ -1950,16 +1974,24 @@ class GridCopyTerminal:
             self._setup_debug_logger()
             self._debug_log("Grid Copy Terminal starting (debug enabled via CLI)")
         
+        # Initialize HTTP session for connection pooling (Priority 6)
+        self.http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10),
+            connector=aiohttp.TCPConnector(limit=20, keepalive_timeout=30)
+        )
+        
         # Setup
         if not await self.setup():
             self._debug_log("Setup failed, exiting")
+            await self.http_session.close()
             return
         
         self._debug_log("Setup complete")
-        
+    
         if not await self.initialize():
             self.console.print("[red]Initialization failed[/red]")
             self._debug_log("Initialize failed, exiting")
+            await self.http_session.close()
             return
         
         self._debug_log("Initialize complete")
@@ -1968,6 +2000,7 @@ class GridCopyTerminal:
         if not self._get_extended_market(self.watch_token):
             self.console.print(f"[red]✗ {self.watch_token} not found on Extended[/red]")
             self.console.print(f"[yellow]Available markets: {', '.join(list(self.market_info_cache.keys())[:20])}...[/yellow]")
+            await self.http_session.close()
             return
         
         self.console.print(f"\n[green]✓ {self.watch_token} found on Extended[/green]")
@@ -1985,6 +2018,7 @@ class GridCopyTerminal:
         if self.available_balance <= 0:
             self.console.print(f"[red]⚠ No available balance (${self.available_balance:.2f})[/red]")
             self.console.print("[yellow]Deposit funds to Extended DEX before running[/yellow]")
+            await self.http_session.close()
             return
         elif self.available_balance < self.config['min_order_value']:
             self.console.print(f"[yellow]⚠ Low balance: ${self.available_balance:.2f} (min order: ${self.config['min_order_value']})[/yellow]")
@@ -2083,6 +2117,10 @@ class GridCopyTerminal:
                     await self.cancel_order(our_id)
                 except:
                     pass
+            
+            # Close HTTP session (Priority 6)
+            if self.http_session:
+                await self.http_session.close()
             
             self.console.print("[green]Grid Copy Terminal stopped[/green]")
 

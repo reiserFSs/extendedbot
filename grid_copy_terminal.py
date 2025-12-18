@@ -1502,11 +1502,17 @@ class GridCopyTerminal:
         
         # Setup
         if not await self.setup():
+            self._debug_log("Setup failed, exiting")
             return
+        
+        self._debug_log("Setup complete")
         
         if not await self.initialize():
             self.console.print("[red]Initialization failed[/red]")
+            self._debug_log("Initialize failed, exiting")
             return
+        
+        self._debug_log("Initialize complete")
         
         # Check if token is supported on Extended
         if not self._get_extended_market(self.watch_token):
@@ -1555,11 +1561,13 @@ class GridCopyTerminal:
                 
                 while self.is_running:
                     import select
-                    if select.select([sys.stdin], [], [], 0.1)[0]:
+                    # Non-blocking check with very short timeout
+                    if select.select([sys.stdin], [], [], 0.01)[0]:
                         key = sys.stdin.read(1).lower()
                         if key == 'q':
                             self.is_running = False
-                    # await asyncio.sleep(0.1)  # Rate limit disabled
+                    # Yield to event loop - THIS IS CRITICAL
+                    await asyncio.sleep(0.1)
             finally:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         
@@ -1567,31 +1575,44 @@ class GridCopyTerminal:
         
         last_rest_sync = time.time()
         
+        self._debug_log("Starting main loop")
+        
         try:
             with Live(layout, console=self.console, refresh_per_second=10) as live:
+                self._debug_log("Live display started")
                 while self.is_running:
-                    # REST sync as backup (every sync_interval seconds)
-                    now = time.time()
-                    if now - last_rest_sync >= self.sync_interval:
-                        try:
-                            await self.sync_orders()
-                            last_rest_sync = now
-                            self.last_error = None
-                        except Exception as e:
-                            self.last_error = str(e)
+                    try:
+                        # REST sync as backup (every sync_interval seconds)
+                        now = time.time()
+                        if now - last_rest_sync >= self.sync_interval:
+                            try:
+                                await self.sync_orders()
+                                last_rest_sync = now
+                                self.last_error = None
+                            except Exception as e:
+                                self.last_error = str(e)
+                                self._debug_log(f"SYNC ERROR: {e}")
+                        
+                        # Update display
+                        layout["header"].update(self.render_header())
+                        layout["stats"].update(self.render_stats())
+                        layout["target_orders"].update(self.render_target_orders())
+                        layout["our_orders"].update(self.render_our_orders())
+                        layout["activity"].update(self.render_activity())
+                        layout["footer"].update(self.render_footer())
+                        
+                        # Yield to asyncio event loop (required for WebSocket/keyboard handling)
+                        await asyncio.sleep(0.05)
                     
-                    # Update display
-                    layout["header"].update(self.render_header())
-                    layout["stats"].update(self.render_stats())
-                    layout["target_orders"].update(self.render_target_orders())
-                    layout["our_orders"].update(self.render_our_orders())
-                    layout["activity"].update(self.render_activity())
-                    layout["footer"].update(self.render_footer())
-                    
-                    # Fast loop for responsive UI (WebSocket handles order events)
-                    # await asyncio.sleep(0.1)  # Rate limit disabled
+                    except Exception as e:
+                        self._debug_log(f"MAIN LOOP ERROR: {e}")
+                        self.last_error = str(e)
+                        await asyncio.sleep(0.5)  # Back off on error
+                
+                self._debug_log(f"Main loop exited, is_running={self.is_running}")
         
         finally:
+            self._debug_log("Entering finally block")
             self.is_running = False
             keyboard_task.cancel()
             
@@ -1617,7 +1638,15 @@ async def main():
         terminal.debug_mode = True
         terminal.console.print("[yellow]Debug mode enabled via command line[/yellow]")
     
-    await terminal.run()
+    try:
+        await terminal.run()
+    except Exception as e:
+        terminal.console.print(f"[red]FATAL ERROR: {e}[/red]")
+        if terminal.debug_mode and terminal.debug_logger:
+            terminal._debug_log(f"FATAL ERROR: {type(e).__name__}: {e}")
+            import traceback
+            terminal._debug_log(f"Traceback:\n{traceback.format_exc()}")
+        raise
 
 
 if __name__ == "__main__":

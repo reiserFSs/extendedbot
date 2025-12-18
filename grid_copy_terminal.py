@@ -145,10 +145,12 @@ class GridCopyTerminal:
             'side': None,       # 'LONG', 'SHORT', or None
         }
         self.last_position_fetch = 0
-        self.position_fetch_interval = 3.0  # Check position every 3s
+        self.position_fetch_interval = 5.0  # Full API refresh every 5s
         self.take_profit_pending = False    # Avoid duplicate TP orders
         self.take_profit_order_id = None
-        self.total_realized_pnl = 0.0       # Track cumulative profit
+        self.pending_tp_profit = 0.0        # Expected profit from pending TP (not yet confirmed)
+        self.pre_tp_position_size = 0.0     # Position size before TP order (to detect close)
+        self.total_realized_pnl = 0.0       # Track cumulative CONFIRMED profit
         
         # Stats
         self.orders_placed = 0
@@ -1114,16 +1116,55 @@ class GridCopyTerminal:
             self._debug_log(f"POSITION ERROR: {e}")
             return self.current_position
     
+    def _update_local_pnl(self):
+        """Update unrealized PnL locally using orderbook price (fast, no API call)"""
+        if self.current_position['size'] == 0 or self.current_position['entry_price'] == 0:
+            return
+        
+        market_name = self._get_extended_market(self.watch_token)
+        if not market_name:
+            return
+        
+        cached_ob = self.orderbook_cache.get(market_name, {})
+        size = self.current_position['size']
+        entry_price = self.current_position['entry_price']
+        
+        # Use bid for longs (what we'd get if we sell), ask for shorts
+        if size > 0:
+            current_price = cached_ob.get('best_bid', 0)
+        else:
+            current_price = cached_ob.get('best_ask', 0)
+        
+        if current_price > 0:
+            unrealized_pnl = (current_price - entry_price) * size
+            notional = abs(size * entry_price)
+            pnl_pct = (unrealized_pnl / notional * 100) if notional > 0 else 0
+            
+            self.current_position['unrealized_pnl'] = unrealized_pnl
+            self.current_position['unrealized_pnl_pct'] = pnl_pct
+    
     async def check_and_execute_take_profit(self) -> bool:
         """Check if take-profit should trigger and execute if so"""
         tp_threshold = self.config.get('take_profit_percent', 0)
         
-        # Skip if take-profit disabled or already pending
-        if tp_threshold <= 0 or self.take_profit_pending:
+        # Skip if take-profit disabled
+        if tp_threshold <= 0:
             return False
         
-        # Fetch current position
-        position = await self.fetch_position()
+        # If TP is pending, check if position closed (to confirm realized PnL)
+        if self.take_profit_pending:
+            await self._check_tp_fill_status()
+            return False
+        
+        # Update PnL locally using orderbook (fast, every loop iteration)
+        self._update_local_pnl()
+        
+        # Periodically fetch full position from API to sync entry price & size
+        now = time.time()
+        if now - self.last_position_fetch >= self.position_fetch_interval:
+            await self.fetch_position()
+        
+        position = self.current_position
         
         # Skip if no position
         if position['size'] == 0 or position['side'] is None:
@@ -1134,11 +1175,36 @@ class GridCopyTerminal:
             self._debug_log(f"TAKE-PROFIT TRIGGERED: {position['unrealized_pnl_pct']:.2f}% >= {tp_threshold}%")
             self.log_activity("TP", self.watch_token, f"Triggered @ {position['unrealized_pnl_pct']:.2f}%", "info")
             
+            # Store position size before TP to detect fill
+            self.pre_tp_position_size = abs(position['size'])
+            self.pending_tp_profit = position['unrealized_pnl']
+            
             # Place take-profit order
             success = await self.place_take_profit_order(position)
             return success
         
         return False
+    
+    async def _check_tp_fill_status(self):
+        """Check if take-profit order filled by comparing position size"""
+        # Force fresh position fetch
+        self.last_position_fetch = 0
+        await self.fetch_position()
+        
+        current_size = abs(self.current_position['size'])
+        
+        # If position closed or significantly reduced, TP filled
+        if current_size < self.pre_tp_position_size * 0.1:  # 90%+ reduction
+            # Confirmed fill - count realized PnL
+            self.total_realized_pnl += self.pending_tp_profit
+            self._debug_log(f"TAKE-PROFIT FILLED: Realized ${self.pending_tp_profit:.2f}, Total: ${self.total_realized_pnl:.2f}")
+            self.log_activity("TP", self.watch_token, f"Filled +${self.pending_tp_profit:.2f}", "success")
+            
+            # Reset pending state
+            self.pending_tp_profit = 0.0
+            self.pre_tp_position_size = 0.0
+            self.take_profit_pending = False
+            self.take_profit_order_id = None
     
     async def place_take_profit_order(self, position: Dict) -> bool:
         """Place a limit order to close the entire position at current price (with retry)"""
@@ -1180,12 +1246,13 @@ class GridCopyTerminal:
                 
                 if order_id:
                     self.take_profit_order_id = order_id
-                    self.total_realized_pnl += position['unrealized_pnl']
+                    # Don't count realized PnL yet - wait for fill confirmation in _check_tp_fill_status
                     self.log_activity("TP", self.watch_token, 
-                        f"{close_side} {size:.4f} @ ${close_price:.4f}", "success")
-                    self._debug_log(f"TAKE-PROFIT SUCCESS: Order {order_id}")
+                        f"{close_side} {size:.4f} @ ${close_price:.4f}", "pending")
+                    self._debug_log(f"TAKE-PROFIT PLACED: Order {order_id} (awaiting fill)")
                     
-                    # Clear the pending flag after a short delay to allow fill
+                    # Keep take_profit_pending = True, _check_tp_fill_status will verify fill
+                    # Start timeout task as fallback
                     asyncio.create_task(self._clear_take_profit_pending())
                     return True
                 else:
@@ -1206,12 +1273,16 @@ class GridCopyTerminal:
             return False
     
     async def _clear_take_profit_pending(self):
-        """Clear take-profit pending flag after delay"""
-        await asyncio.sleep(5.0)  # Wait for order to fill
-        self.take_profit_pending = False
-        self.take_profit_order_id = None
-        # Force position refresh
-        self.last_position_fetch = 0
+        """Clear take-profit pending flag after timeout (fallback if fill check misses it)"""
+        await asyncio.sleep(30.0)  # Wait longer for fill verification to catch it
+        if self.take_profit_pending:
+            self._debug_log(f"TAKE-PROFIT TIMEOUT: Resetting pending state (fill not confirmed)")
+            self.take_profit_pending = False
+            self.take_profit_order_id = None
+            self.pending_tp_profit = 0.0
+            self.pre_tp_position_size = 0.0
+            # Force position refresh
+            self.last_position_fetch = 0
     
     def calculate_our_size(self, target_size: float, price: float) -> float:
         """Calculate our order size based on target's size and our total balance"""
@@ -2202,10 +2273,13 @@ class GridCopyTerminal:
                     text.append(f"@ {tp_thresh}%\n", style="dim")
         
         # Total realized PnL
-        if self.total_realized_pnl != 0:
+        if self.total_realized_pnl != 0 or self.pending_tp_profit != 0:
             text.append(f"Realized PnL     ", style="white")
             pnl_color = "green" if self.total_realized_pnl >= 0 else "red"
-            text.append(f"${self.total_realized_pnl:.2f}\n", style=pnl_color)
+            text.append(f"${self.total_realized_pnl:.2f}", style=pnl_color)
+            if self.pending_tp_profit != 0:
+                text.append(f" (+${self.pending_tp_profit:.2f} pending)", style="yellow")
+            text.append(f"\n", style="white")
         
         text.append(f"\n", style="white")
         

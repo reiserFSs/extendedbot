@@ -1662,19 +1662,39 @@ class GridCopyTerminal:
         if position['size'] == 0 or position['side'] is None:
             return False
         
-        # NEVER place take-profit on negative PnL
+        # CRITICAL: Triple-check we're not at a loss
+        # Check 1: Raw PnL must be positive
         if position['unrealized_pnl'] < 0:
             return False
         
-        # Double-check: PnL percentage must also be positive
+        # Check 2: PnL percentage must be positive
         if position['unrealized_pnl_pct'] < 0:
             self._debug_log(f"TP SAFETY: PnL% negative ({position['unrealized_pnl_pct']:.2f}%), skipping")
             return False
         
+        # Check 3: Verify PnL calculation makes sense
+        # For LONG: current_price should be > entry_price
+        # For SHORT: current_price should be < entry_price
+        market_name = self._get_extended_market(self.watch_token)
+        cached_ob = self.orderbook_cache.get(market_name, {}) if market_name else {}
+        
+        if position['side'] == 'LONG':
+            exit_price = cached_ob.get('best_bid', 0)
+            if exit_price > 0 and exit_price <= position['entry_price']:
+                self._debug_log(f"TP SAFETY: LONG but bid ${exit_price:.4f} <= entry ${position['entry_price']:.4f}, skipping")
+                return False
+        elif position['side'] == 'SHORT':
+            exit_price = cached_ob.get('best_ask', 0)
+            if exit_price > 0 and exit_price >= position['entry_price']:
+                self._debug_log(f"TP SAFETY: SHORT but ask ${exit_price:.4f} >= entry ${position['entry_price']:.4f}, skipping")
+                return False
+        
         # Check if unrealized profit exceeds threshold
         if position['unrealized_pnl_pct'] >= tp_threshold:
+            # Log full details before triggering
             self._debug_log(f"TAKE-PROFIT TRIGGERED: {position['unrealized_pnl_pct']:.2f}% >= {tp_threshold}%")
             self._debug_log(f"  Position: {position['side']} size={position['size']:.4f} entry=${position['entry_price']:.4f}")
+            self._debug_log(f"  Exit price: ${exit_price:.4f} (bid={cached_ob.get('best_bid', 0):.4f}, ask={cached_ob.get('best_ask', 0):.4f})")
             self._debug_log(f"  PnL: ${position['unrealized_pnl']:.2f} ({position['unrealized_pnl_pct']:.2f}%)")
             self.log_activity("TP", self.watch_token, f"Triggered @ {position['unrealized_pnl_pct']:.2f}%", "info")
             
@@ -1721,13 +1741,29 @@ class GridCopyTerminal:
             best_bid = cached_ob.get('best_bid', 0)
             best_ask = cached_ob.get('best_ask', 0)
             
+            # FINAL SANITY CHECK: Verify the exit price will result in profit
+            if position['side'] == 'LONG':
+                # To profit on LONG, we need to SELL above entry
+                if best_bid > 0 and best_bid <= entry_price:
+                    self._debug_log(f"TAKE-PROFIT ABORTED: LONG but best_bid ${best_bid:.4f} <= entry ${entry_price:.4f}")
+                    self._reset_tp_state()
+                    return False
+            elif position['side'] == 'SHORT':
+                # To profit on SHORT, we need to BUY below entry
+                if best_ask > 0 and best_ask >= entry_price:
+                    self._debug_log(f"TAKE-PROFIT ABORTED: SHORT but best_ask ${best_ask:.4f} >= entry ${entry_price:.4f}")
+                    self._reset_tp_state()
+                    return False
+            
             # Step 1: Try limit order at best price (maker, 0% fee)
             if close_side == 'SELL':
                 limit_price = best_bid if best_bid > 0 else entry_price * 1.005
+                expected_limit_pnl = (limit_price - entry_price) * size
             else:
                 limit_price = best_ask if best_ask > 0 else entry_price * 0.995
+                expected_limit_pnl = (entry_price - limit_price) * size
             
-            self._debug_log(f"  Step 1: Limit order @ ${limit_price:.4f}")
+            self._debug_log(f"  Step 1: Limit order @ ${limit_price:.4f} (expected PnL: ${expected_limit_pnl:.2f})")
             
             order_id = await self.place_order(
                 coin=self.watch_token,
@@ -1740,6 +1776,8 @@ class GridCopyTerminal:
                 self._debug_log(f"  Limit order failed, trying market directly...")
             else:
                 self.take_profit_order_id = order_id
+                # Update pending profit to reflect limit price
+                self.pending_tp_profit = expected_limit_pnl
                 self.log_activity("TP", self.watch_token, f"Limit {close_side} @ ${limit_price:.4f}", "pending")
                 
                 # Step 2: Wait briefly for fill (2 seconds)
@@ -1751,7 +1789,7 @@ class GridCopyTerminal:
                 
                 current_size = abs(self.current_position.get('size', 0))
                 if current_size < size * 0.1:  # 90%+ reduction = filled
-                    self._debug_log(f"  Limit order FILLED! Position closed.")
+                    self._debug_log(f"  Limit order FILLED! Realized: ${self.pending_tp_profit:.2f}")
                     self.total_realized_pnl += self.pending_tp_profit
                     self.log_activity("TP", self.watch_token, f"Filled +${self.pending_tp_profit:.2f}", "success")
                     self._reset_tp_state()
@@ -1782,14 +1820,38 @@ class GridCopyTerminal:
             best_bid = cached_ob.get('best_bid', 0)
             best_ask = cached_ob.get('best_ask', 0)
             
-            if close_side == 'SELL':
-                # Sell into bids - use bid price with small buffer below
+            # Calculate market price WITH slippage buffer
+            if close_side == 'SELL':  # Closing LONG
+                # Sell into bids - use bid price with small buffer below for guaranteed fill
                 market_price = best_bid * 0.999 if best_bid > 0 else entry_price * 0.995
-            else:
-                # Buy into asks - use ask price with small buffer above
+                
+                # CRITICAL: Check if market_price (with slippage) is still profitable
+                if market_price <= entry_price:
+                    self._debug_log(f"  Market order ABORTED: market_price ${market_price:.4f} <= entry ${entry_price:.4f}")
+                    self._debug_log(f"  (best_bid=${best_bid:.4f}, with 0.1% slippage = ${market_price:.4f})")
+                    self.log_activity("TP", self.watch_token, "Aborted - would close at loss", "skip")
+                    self._reset_tp_state()
+                    return False
+                    
+            else:  # Closing SHORT
+                # Buy into asks - use ask price with small buffer above for guaranteed fill
                 market_price = best_ask * 1.001 if best_ask > 0 else entry_price * 1.005
+                
+                # CRITICAL: Check if market_price (with slippage) is still profitable
+                if market_price >= entry_price:
+                    self._debug_log(f"  Market order ABORTED: market_price ${market_price:.4f} >= entry ${entry_price:.4f}")
+                    self._debug_log(f"  (best_ask=${best_ask:.4f}, with 0.1% slippage = ${market_price:.4f})")
+                    self.log_activity("TP", self.watch_token, "Aborted - would close at loss", "skip")
+                    self._reset_tp_state()
+                    return False
             
-            self._debug_log(f"  Step 5: Market order @ ${market_price:.4f} (crossing spread)")
+            # Calculate expected profit from this market order
+            expected_pnl = (market_price - entry_price) * size if close_side == 'SELL' else (entry_price - market_price) * size
+            
+            # Update pending profit to reflect actual market order price
+            self.pending_tp_profit = expected_pnl
+            
+            self._debug_log(f"  Step 5: Market order @ ${market_price:.4f} (expected PnL: ${expected_pnl:.2f})")
             self.log_activity("TP", self.watch_token, f"Market {close_side} @ ${market_price:.4f}", "pending")
             
             # Remaining size (might have partially filled)
@@ -1816,7 +1878,7 @@ class GridCopyTerminal:
                 current_size = abs(self.current_position.get('size', 0))
                 
                 if current_size < remaining_size * 0.1:
-                    self._debug_log(f"  Market order FILLED!")
+                    self._debug_log(f"  Market order FILLED! Realized: ${self.pending_tp_profit:.2f}")
                     self.total_realized_pnl += self.pending_tp_profit
                     self.log_activity("TP", self.watch_token, f"Filled +${self.pending_tp_profit:.2f}", "success")
                     self._reset_tp_state()

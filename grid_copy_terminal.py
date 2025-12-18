@@ -294,7 +294,8 @@ class GridCopyTerminal:
         # Take-profit settings
         self.console.print("\n[bold]Take-Profit Settings[/bold]")
         self.console.print("[dim]Auto-close position at X% unrealized profit (0 = disabled)[/dim]")
-        self.console.print("[dim]Recommended: 0.4-0.5% to cover fees and lock profit[/dim]")
+        self.console.print("[dim]Recommended: 0.3-0.5% for normal markets[/dim]")
+        self.console.print("[dim]For scalping: 0.04-0.1% (uses smaller slippage buffer)[/dim]")
         config['take_profit_percent'] = float(input("Take-Profit % (default 0.5): ").strip() or "0.5")
         
         # Max position (inventory limit)
@@ -1669,7 +1670,7 @@ class GridCopyTerminal:
         
         # Check 2: PnL percentage must be positive
         if position['unrealized_pnl_pct'] < 0:
-            self._debug_log(f"TP SAFETY: PnL% negative ({position['unrealized_pnl_pct']:.2f}%), skipping")
+            self._debug_log(f"TP SAFETY: PnL% negative ({position['unrealized_pnl_pct']:.3f}%), skipping")
             return False
         
         # Check 3: Verify PnL calculation makes sense
@@ -1692,11 +1693,11 @@ class GridCopyTerminal:
         # Check if unrealized profit exceeds threshold
         if position['unrealized_pnl_pct'] >= tp_threshold:
             # Log full details before triggering
-            self._debug_log(f"TAKE-PROFIT TRIGGERED: {position['unrealized_pnl_pct']:.2f}% >= {tp_threshold}%")
+            self._debug_log(f"TAKE-PROFIT TRIGGERED: {position['unrealized_pnl_pct']:.3f}% >= {tp_threshold:.3f}%")
             self._debug_log(f"  Position: {position['side']} size={position['size']:.4f} entry=${position['entry_price']:.4f}")
             self._debug_log(f"  Exit price: ${exit_price:.4f} (bid={cached_ob.get('best_bid', 0):.4f}, ask={cached_ob.get('best_ask', 0):.4f})")
-            self._debug_log(f"  PnL: ${position['unrealized_pnl']:.2f} ({position['unrealized_pnl_pct']:.2f}%)")
-            self.log_activity("TP", self.watch_token, f"Triggered @ {position['unrealized_pnl_pct']:.2f}%", "info")
+            self._debug_log(f"  PnL: ${position['unrealized_pnl']:.4f} ({position['unrealized_pnl_pct']:.3f}%)")
+            self.log_activity("TP", self.watch_token, f"Triggered @ {position['unrealized_pnl_pct']:.3f}%", "info")
             
             # Store position size before TP to detect fill
             self.pre_tp_position_size = abs(position['size'])
@@ -1820,27 +1821,34 @@ class GridCopyTerminal:
             best_bid = cached_ob.get('best_bid', 0)
             best_ask = cached_ob.get('best_ask', 0)
             
-            # Calculate market price WITH slippage buffer
+            # Dynamic slippage based on TP target
+            # For small TP targets, use smaller slippage to preserve profit
+            tp_threshold = self.config.get('take_profit_percent', 0.5)
+            # Slippage = 1/4 of TP threshold, capped between 0.01% and 0.1%
+            slippage_pct = min(0.001, max(0.0001, tp_threshold / 100 / 4))
+            self._debug_log(f"  Using slippage: {slippage_pct*100:.3f}% (TP threshold: {tp_threshold}%)")
+            
+            # Calculate market price WITH dynamic slippage buffer
             if close_side == 'SELL':  # Closing LONG
-                # Sell into bids - use bid price with small buffer below for guaranteed fill
-                market_price = best_bid * 0.999 if best_bid > 0 else entry_price * 0.995
+                # Sell into bids - use bid price with buffer below for guaranteed fill
+                market_price = best_bid * (1 - slippage_pct) if best_bid > 0 else entry_price * 0.995
                 
                 # CRITICAL: Check if market_price (with slippage) is still profitable
                 if market_price <= entry_price:
                     self._debug_log(f"  Market order ABORTED: market_price ${market_price:.4f} <= entry ${entry_price:.4f}")
-                    self._debug_log(f"  (best_bid=${best_bid:.4f}, with 0.1% slippage = ${market_price:.4f})")
+                    self._debug_log(f"  (best_bid=${best_bid:.4f}, with {slippage_pct*100:.3f}% slippage = ${market_price:.4f})")
                     self.log_activity("TP", self.watch_token, "Aborted - would close at loss", "skip")
                     self._reset_tp_state()
                     return False
                     
             else:  # Closing SHORT
-                # Buy into asks - use ask price with small buffer above for guaranteed fill
-                market_price = best_ask * 1.001 if best_ask > 0 else entry_price * 1.005
+                # Buy into asks - use ask price with buffer above for guaranteed fill
+                market_price = best_ask * (1 + slippage_pct) if best_ask > 0 else entry_price * 1.005
                 
                 # CRITICAL: Check if market_price (with slippage) is still profitable
                 if market_price >= entry_price:
                     self._debug_log(f"  Market order ABORTED: market_price ${market_price:.4f} >= entry ${entry_price:.4f}")
-                    self._debug_log(f"  (best_ask=${best_ask:.4f}, with 0.1% slippage = ${market_price:.4f})")
+                    self._debug_log(f"  (best_ask=${best_ask:.4f}, with {slippage_pct*100:.3f}% slippage = ${market_price:.4f})")
                     self.log_activity("TP", self.watch_token, "Aborted - would close at loss", "skip")
                     self._reset_tp_state()
                     return False
@@ -3095,7 +3103,11 @@ class GridCopyTerminal:
             
             text.append(f"Unrealized PnL   ", style="white")
             pnl_color = "green" if pos['unrealized_pnl'] >= 0 else "red"
-            text.append(f"${pos['unrealized_pnl']:.2f} ({pos['unrealized_pnl_pct']:.2f}%)\n", style=pnl_color)
+            # Use more decimal places for small values
+            if abs(pos['unrealized_pnl_pct']) < 0.1:
+                text.append(f"${pos['unrealized_pnl']:.2f} ({pos['unrealized_pnl_pct']:.3f}%)\n", style=pnl_color)
+            else:
+                text.append(f"${pos['unrealized_pnl']:.2f} ({pos['unrealized_pnl_pct']:.2f}%)\n", style=pnl_color)
             
             # Take-profit threshold
             tp_thresh = self.config.get('take_profit_percent', 0)
@@ -3104,9 +3116,16 @@ class GridCopyTerminal:
                 if self.take_profit_pending:
                     text.append(f"PENDING...\n", style="yellow")
                 elif pos['unrealized_pnl_pct'] >= tp_thresh * 0.8:  # 80% of threshold
-                    text.append(f"@ {tp_thresh}% (CLOSE)\n", style="yellow")
+                    # Use appropriate precision for display
+                    if tp_thresh < 0.1:
+                        text.append(f"@ {tp_thresh:.2f}% (CLOSE)\n", style="yellow")
+                    else:
+                        text.append(f"@ {tp_thresh}% (CLOSE)\n", style="yellow")
                 else:
-                    text.append(f"@ {tp_thresh}%\n", style="dim")
+                    if tp_thresh < 0.1:
+                        text.append(f"@ {tp_thresh:.2f}%\n", style="dim")
+                    else:
+                        text.append(f"@ {tp_thresh}%\n", style="dim")
         
         # Total realized PnL
         if self.total_realized_pnl != 0 or self.pending_tp_profit != 0:

@@ -135,6 +135,21 @@ class GridCopyTerminal:
         # verbose_mode = log everything (hot path details)
         self.verbose_mode = False
         
+        # Position tracking & take-profit
+        self.current_position: Dict = {
+            'size': 0.0,        # Positive = long, negative = short
+            'entry_price': 0.0,
+            'unrealized_pnl': 0.0,
+            'unrealized_pnl_pct': 0.0,
+            'notional': 0.0,
+            'side': None,       # 'LONG', 'SHORT', or None
+        }
+        self.last_position_fetch = 0
+        self.position_fetch_interval = 2.0  # Check position every 2s
+        self.take_profit_pending = False    # Avoid duplicate TP orders
+        self.take_profit_order_id = None
+        self.total_realized_pnl = 0.0       # Track cumulative profit
+        
         # Stats
         self.orders_placed = 0
         self.orders_cancelled = 0
@@ -254,6 +269,12 @@ class GridCopyTerminal:
         
         self.console.print("[dim]Leverage multiplier (1-50, lower = safer)[/dim]")
         config['leverage'] = int(input("Leverage (default 1): ").strip() or "1")
+        
+        # Take-profit settings
+        self.console.print("\n[bold]Take-Profit Settings[/bold]")
+        self.console.print("[dim]Auto-close position at X% unrealized profit (0 = disabled)[/dim]")
+        self.console.print("[dim]Recommended: 0.4-0.5% to cover fees and lock profit[/dim]")
+        config['take_profit_percent'] = float(input("Take-Profit % (default 0.5): ").strip() or "0.5")
         
         # Network
         config['use_testnet'] = input("Use Testnet? (y/N): ").strip().lower() == 'y'
@@ -908,6 +929,226 @@ class GridCopyTerminal:
         except Exception as e:
             self._debug_log(f"BALANCE ERROR: {e}")
             return self.available_balance  # Return cached value on error
+    
+    async def fetch_position(self) -> Dict:
+        """Fetch current position from Extended"""
+        try:
+            now = time.time()
+            # Use cached position if recent enough
+            if now - self.last_position_fetch < self.position_fetch_interval:
+                return self.current_position
+            
+            market_name = self._get_extended_market(self.watch_token)
+            if not market_name:
+                return self.current_position
+            
+            # Try to get positions from Extended
+            positions = None
+            
+            # Method 1: account.get_positions()
+            if hasattr(self.extended_client, 'account') and hasattr(self.extended_client.account, 'get_positions'):
+                try:
+                    positions = await self.extended_client.account.get_positions()
+                    self._verbose_log(f"POSITION: Raw response: {positions}")
+                except Exception as e:
+                    self._verbose_log(f"POSITION Method 1 failed: {e}")
+            
+            # Method 2: positions.get_positions()
+            if positions is None and hasattr(self.extended_client, 'positions'):
+                try:
+                    positions = await self.extended_client.positions.get_positions()
+                    self._verbose_log(f"POSITION: Method 2 response: {positions}")
+                except Exception as e:
+                    self._verbose_log(f"POSITION Method 2 failed: {e}")
+            
+            # Method 3: get_account_state or similar
+            if positions is None and hasattr(self.extended_client, 'get_account_state'):
+                try:
+                    state = await self.extended_client.get_account_state()
+                    if hasattr(state, 'positions'):
+                        positions = state.positions
+                    self._verbose_log(f"POSITION: Method 3 response: {state}")
+                except Exception as e:
+                    self._verbose_log(f"POSITION Method 3 failed: {e}")
+            
+            if positions:
+                # Parse positions - look for our market
+                position_list = []
+                if hasattr(positions, 'data'):
+                    position_list = positions.data if isinstance(positions.data, list) else [positions.data]
+                elif isinstance(positions, list):
+                    position_list = positions
+                elif hasattr(positions, '__iter__'):
+                    position_list = list(positions)
+                
+                for pos in position_list:
+                    pos_market = None
+                    if hasattr(pos, 'market'):
+                        pos_market = pos.market
+                    elif hasattr(pos, 'symbol'):
+                        pos_market = pos.symbol
+                    elif isinstance(pos, dict):
+                        pos_market = pos.get('market', pos.get('symbol', ''))
+                    
+                    if pos_market and (pos_market == market_name or self.watch_token in str(pos_market).upper()):
+                        # Found our position
+                        size = 0.0
+                        entry_price = 0.0
+                        unrealized_pnl = 0.0
+                        
+                        # Extract size
+                        if hasattr(pos, 'size'):
+                            size = float(pos.size)
+                        elif hasattr(pos, 'quantity'):
+                            size = float(pos.quantity)
+                        elif hasattr(pos, 'amount'):
+                            size = float(pos.amount)
+                        elif isinstance(pos, dict):
+                            size = float(pos.get('size', pos.get('quantity', pos.get('amount', 0))))
+                        
+                        # Extract entry price
+                        if hasattr(pos, 'entry_price'):
+                            entry_price = float(pos.entry_price)
+                        elif hasattr(pos, 'avg_price'):
+                            entry_price = float(pos.avg_price)
+                        elif hasattr(pos, 'average_price'):
+                            entry_price = float(pos.average_price)
+                        elif isinstance(pos, dict):
+                            entry_price = float(pos.get('entry_price', pos.get('avg_price', pos.get('average_price', 0))))
+                        
+                        # Extract unrealized PnL if available
+                        if hasattr(pos, 'unrealized_pnl'):
+                            unrealized_pnl = float(pos.unrealized_pnl)
+                        elif hasattr(pos, 'pnl'):
+                            unrealized_pnl = float(pos.pnl)
+                        elif isinstance(pos, dict):
+                            unrealized_pnl = float(pos.get('unrealized_pnl', pos.get('pnl', 0)))
+                        
+                        # Calculate unrealized PnL if not provided
+                        if unrealized_pnl == 0 and size != 0 and entry_price > 0:
+                            cached_ob = self.orderbook_cache.get(market_name, {})
+                            current_price = cached_ob.get('best_bid', 0) if size > 0 else cached_ob.get('best_ask', 0)
+                            if current_price > 0:
+                                unrealized_pnl = (current_price - entry_price) * size
+                        
+                        # Calculate percentage
+                        notional = abs(size * entry_price)
+                        pnl_pct = (unrealized_pnl / notional * 100) if notional > 0 else 0
+                        
+                        self.current_position = {
+                            'size': size,
+                            'entry_price': entry_price,
+                            'unrealized_pnl': unrealized_pnl,
+                            'unrealized_pnl_pct': pnl_pct,
+                            'notional': notional,
+                            'side': 'LONG' if size > 0 else ('SHORT' if size < 0 else None),
+                        }
+                        
+                        self._verbose_log(f"POSITION: {self.current_position}")
+                        break
+                else:
+                    # No position found for this market
+                    self.current_position = {
+                        'size': 0.0,
+                        'entry_price': 0.0,
+                        'unrealized_pnl': 0.0,
+                        'unrealized_pnl_pct': 0.0,
+                        'notional': 0.0,
+                        'side': None,
+                    }
+            
+            self.last_position_fetch = now
+            return self.current_position
+            
+        except Exception as e:
+            self._debug_log(f"POSITION ERROR: {e}")
+            return self.current_position
+    
+    async def check_and_execute_take_profit(self) -> bool:
+        """Check if take-profit should trigger and execute if so"""
+        tp_threshold = self.config.get('take_profit_percent', 0)
+        
+        # Skip if take-profit disabled or already pending
+        if tp_threshold <= 0 or self.take_profit_pending:
+            return False
+        
+        # Fetch current position
+        position = await self.fetch_position()
+        
+        # Skip if no position
+        if position['size'] == 0 or position['side'] is None:
+            return False
+        
+        # Check if unrealized profit exceeds threshold
+        if position['unrealized_pnl_pct'] >= tp_threshold:
+            self._debug_log(f"TAKE-PROFIT TRIGGERED: {position['unrealized_pnl_pct']:.2f}% >= {tp_threshold}%")
+            self.log_activity("TP", self.watch_token, f"Triggered @ {position['unrealized_pnl_pct']:.2f}%", "info")
+            
+            # Place take-profit order
+            success = await self.place_take_profit_order(position)
+            return success
+        
+        return False
+    
+    async def place_take_profit_order(self, position: Dict) -> bool:
+        """Place a limit order to close the entire position at current price"""
+        try:
+            self.take_profit_pending = True
+            
+            size = abs(position['size'])
+            entry_price = position['entry_price']
+            
+            # Determine side (opposite of position)
+            if position['side'] == 'LONG':
+                close_side = 'SELL'
+                # Use best bid for selling (guaranteed fill)
+                market_name = self._get_extended_market(self.watch_token)
+                cached_ob = self.orderbook_cache.get(market_name, {})
+                close_price = cached_ob.get('best_bid', entry_price * 1.005)  # Fallback to entry + 0.5%
+            else:
+                close_side = 'BUY'
+                market_name = self._get_extended_market(self.watch_token)
+                cached_ob = self.orderbook_cache.get(market_name, {})
+                close_price = cached_ob.get('best_ask', entry_price * 0.995)  # Fallback to entry - 0.5%
+            
+            self._debug_log(f"TAKE-PROFIT ORDER: {close_side} {size} @ ${close_price:.4f}")
+            self._debug_log(f"  Entry was ${entry_price:.4f}, expected profit: ${position['unrealized_pnl']:.2f}")
+            
+            # Place the order (use taker price to ensure fill)
+            order_id = await self.place_order(
+                coin=self.watch_token,
+                side=close_side,
+                size=size,
+                price=close_price
+            )
+            
+            if order_id:
+                self.take_profit_order_id = order_id
+                self.total_realized_pnl += position['unrealized_pnl']
+                self.log_activity("TP", self.watch_token, 
+                    f"{close_side} {size:.4f} @ ${close_price:.4f}", "success")
+                self._debug_log(f"TAKE-PROFIT SUCCESS: Order {order_id}")
+                
+                # Clear the pending flag after a short delay to allow fill
+                asyncio.create_task(self._clear_take_profit_pending())
+                return True
+            else:
+                self.take_profit_pending = False
+                self.log_activity("TP", self.watch_token, "Order failed", "error")
+                return False
+                
+        except Exception as e:
+            self._debug_log(f"TAKE-PROFIT ERROR: {e}")
+            self.take_profit_pending = False
+            return False
+    
+    async def _clear_take_profit_pending(self):
+        """Clear take-profit pending flag after delay"""
+        await asyncio.sleep(5.0)  # Wait for order to fill
+        self.take_profit_pending = False
+        self.take_profit_order_id = None
+        # Force position refresh
+        self.last_position_fetch = 0
     
     def calculate_our_size(self, target_size: float, price: float) -> float:
         """Calculate our order size based on target's size and our total balance"""
@@ -1858,6 +2099,41 @@ class GridCopyTerminal:
         text.append(f"Leverage         ", style="white")
         text.append(f"{self.current_leverage}x\n", style="cyan")
         
+        # Position info
+        pos = self.current_position
+        if pos['side']:
+            text.append(f"\n", style="white")
+            text.append(f"Position         ", style="white")
+            side_color = "green" if pos['side'] == 'LONG' else "red"
+            text.append(f"{pos['side']} ", style=side_color)
+            text.append(f"{abs(pos['size']):.4f}\n", style="cyan")
+            
+            text.append(f"Entry Price      ", style="white")
+            text.append(f"${pos['entry_price']:.4f}\n", style="dim")
+            
+            text.append(f"Unrealized PnL   ", style="white")
+            pnl_color = "green" if pos['unrealized_pnl'] >= 0 else "red"
+            text.append(f"${pos['unrealized_pnl']:.2f} ({pos['unrealized_pnl_pct']:.2f}%)\n", style=pnl_color)
+            
+            # Take-profit threshold
+            tp_thresh = self.config.get('take_profit_percent', 0)
+            if tp_thresh > 0:
+                text.append(f"Take-Profit      ", style="white")
+                if self.take_profit_pending:
+                    text.append(f"PENDING...\n", style="yellow")
+                elif pos['unrealized_pnl_pct'] >= tp_thresh * 0.8:  # 80% of threshold
+                    text.append(f"@ {tp_thresh}% (CLOSE)\n", style="yellow")
+                else:
+                    text.append(f"@ {tp_thresh}%\n", style="dim")
+        
+        # Total realized PnL
+        if self.total_realized_pnl != 0:
+            text.append(f"Realized PnL     ", style="white")
+            pnl_color = "green" if self.total_realized_pnl >= 0 else "red"
+            text.append(f"${self.total_realized_pnl:.2f}\n", style=pnl_color)
+        
+        text.append(f"\n", style="white")
+        
         # WebSocket status
         text.append(f"WebSocket        ", style="white")
         if self.ws_connected:
@@ -2162,6 +2438,12 @@ class GridCopyTerminal:
                             except Exception as e:
                                 self.last_error = str(e)
                                 self._debug_log(f"SYNC ERROR: {e}")
+                        
+                        # Check take-profit condition
+                        try:
+                            await self.check_and_execute_take_profit()
+                        except Exception as e:
+                            self._debug_log(f"TAKE-PROFIT ERROR: {e}")
                         
                         # Update display
                         layout["header"].update(self.render_header())

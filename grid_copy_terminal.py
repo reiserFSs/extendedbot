@@ -1402,6 +1402,38 @@ class GridCopyTerminal:
                                     unrealized_pnl = float(pos[key])
                                     break
                         
+                        # Extract side from API (Extended uses separate 'side' field!)
+                        api_side = None
+                        for attr in ['side', 'direction', 'position_side', 'positionSide']:
+                            if hasattr(pos, attr):
+                                val = getattr(pos, attr)
+                                if val is not None:
+                                    api_side = str(val).upper()
+                                    self._debug_log(f"POSITION side from {attr}: {api_side}")
+                                    break
+                        if api_side is None and isinstance(pos, dict):
+                            for key in ['side', 'direction', 'position_side', 'positionSide']:
+                                if key in pos and pos[key]:
+                                    api_side = str(pos[key]).upper()
+                                    break
+                        
+                        # Determine final side and adjust size sign
+                        # Extended returns size as positive with separate 'side' field
+                        if api_side in ['SHORT', 'SELL', 'S']:
+                            final_side = 'SHORT'
+                            # Make size negative for SHORT to match our internal convention
+                            if size > 0:
+                                size = -size
+                        elif api_side in ['LONG', 'BUY', 'B']:
+                            final_side = 'LONG'
+                            # Ensure size is positive for LONG
+                            size = abs(size)
+                        else:
+                            # Fallback: infer from size sign
+                            final_side = 'LONG' if size > 0 else ('SHORT' if size < 0 else None)
+                        
+                        self._debug_log(f"POSITION: api_side={api_side}, final_side={final_side}, size={size}")
+                        
                         # Calculate unrealized PnL if not provided
                         if unrealized_pnl == 0 and size != 0 and entry_price > 0:
                             cached_ob = self.orderbook_cache.get(market_name, {})
@@ -1419,7 +1451,7 @@ class GridCopyTerminal:
                             'unrealized_pnl': unrealized_pnl,
                             'unrealized_pnl_pct': pnl_pct,
                             'notional': notional,
-                            'side': 'LONG' if size > 0 else ('SHORT' if size < 0 else None),
+                            'side': final_side,
                         }
                         
                         self._debug_log(f"POSITION FINAL: {self.current_position}")
@@ -1505,9 +1537,16 @@ class GridCopyTerminal:
         if position['unrealized_pnl'] < 0:
             return False
         
+        # Double-check: PnL percentage must also be positive
+        if position['unrealized_pnl_pct'] < 0:
+            self._debug_log(f"TP SAFETY: PnL% negative ({position['unrealized_pnl_pct']:.2f}%), skipping")
+            return False
+        
         # Check if unrealized profit exceeds threshold
         if position['unrealized_pnl_pct'] >= tp_threshold:
             self._debug_log(f"TAKE-PROFIT TRIGGERED: {position['unrealized_pnl_pct']:.2f}% >= {tp_threshold}%")
+            self._debug_log(f"  Position: {position['side']} size={position['size']:.4f} entry=${position['entry_price']:.4f}")
+            self._debug_log(f"  PnL: ${position['unrealized_pnl']:.2f} ({position['unrealized_pnl_pct']:.2f}%)")
             self.log_activity("TP", self.watch_token, f"Triggered @ {position['unrealized_pnl_pct']:.2f}%", "info")
             
             # Store position size before TP to detect fill
@@ -1544,6 +1583,12 @@ class GridCopyTerminal:
     async def place_take_profit_order(self, position: Dict) -> bool:
         """Place a limit order to close the entire position at current price (with retry)"""
         try:
+            # Safety check: Never TP at a loss
+            if position.get('unrealized_pnl', 0) < 0:
+                self._debug_log(f"TAKE-PROFIT ABORTED: PnL is negative (${position['unrealized_pnl']:.2f})")
+                self.take_profit_pending = False
+                return False
+            
             self.take_profit_pending = True
             
             size = abs(position['size'])
@@ -1553,10 +1598,14 @@ class GridCopyTerminal:
             # Determine side (opposite of position)
             if position['side'] == 'LONG':
                 close_side = 'SELL'
-            else:
+            elif position['side'] == 'SHORT':
                 close_side = 'BUY'
+            else:
+                self._debug_log(f"TAKE-PROFIT ABORTED: Unknown position side ({position['side']})")
+                self.take_profit_pending = False
+                return False
             
-            self._debug_log(f"TAKE-PROFIT ORDER: {close_side} {size}")
+            self._debug_log(f"TAKE-PROFIT ORDER: {close_side} {size} (closing {position['side']})")
             self._debug_log(f"  Entry was ${entry_price:.4f}, expected profit: ${position['unrealized_pnl']:.2f}")
             
             # Retry with backoff for rate limits

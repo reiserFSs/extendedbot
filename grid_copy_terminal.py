@@ -1932,7 +1932,8 @@ class GridCopyTerminal:
                 coin=self.watch_token,
                 side=self.tp_order_side,
                 size=self.tp_order_size,
-                price=price
+                price=price,
+                reduce_only=True  # Close position, don't open new one
             )
             
             if order_id:
@@ -1982,7 +1983,8 @@ class GridCopyTerminal:
                 coin=self.watch_token,
                 side=self.tp_order_side,
                 size=self.tp_order_size,
-                price=market_price
+                price=market_price,
+                reduce_only=True  # Close position, don't open new one
             )
             
             if order_id:
@@ -2363,8 +2365,12 @@ class GridCopyTerminal:
         
         return adjusted
     
-    async def place_order(self, coin: str, side: str, size: float, price: float) -> Optional[str]:
-        """Place a limit order on Extended with automatic precision learning"""
+    async def place_order(self, coin: str, side: str, size: float, price: float, reduce_only: bool = False) -> Optional[str]:
+        """Place a limit order on Extended with automatic precision learning
+        
+        Args:
+            reduce_only: If True, order can only reduce position (for TP/SL orders)
+        """
         try:
             market_name = self._get_extended_market(coin)
             if not market_name:
@@ -2452,6 +2458,8 @@ class GridCopyTerminal:
                     
                     self._verbose_log(f"  Attempt {attempts}: step={try_step}, tick={try_tick}")
                     self._verbose_log(f"    size={rounded_size} ({size_decimals} dec), price={rounded_price} ({price_decimals} dec)")
+                    if reduce_only:
+                        self._verbose_log(f"    reduce_only=True (closing position)")
                     
                     try:
                         # Try with post_only to ensure maker-only execution
@@ -2459,13 +2467,34 @@ class GridCopyTerminal:
                         
                         # Method 1: Direct client with post_only
                         try:
-                            result = await self.extended_client.place_order(
-                                market_name=market_name,
-                                amount_of_synthetic=Decimal(str(rounded_size)),
-                                price=Decimal(str(rounded_price)),
-                                side=order_side,
-                                post_only=True,  # Maker only - reject if would take
-                            )
+                            if reduce_only:
+                                # Try reduce_only (snake_case) first, fallback to reduceOnly (camelCase)
+                                try:
+                                    result = await self.extended_client.place_order(
+                                        market_name=market_name,
+                                        amount_of_synthetic=Decimal(str(rounded_size)),
+                                        price=Decimal(str(rounded_price)),
+                                        side=order_side,
+                                        post_only=True,
+                                        reduce_only=True,
+                                    )
+                                except TypeError:
+                                    result = await self.extended_client.place_order(
+                                        market_name=market_name,
+                                        amount_of_synthetic=Decimal(str(rounded_size)),
+                                        price=Decimal(str(rounded_price)),
+                                        side=order_side,
+                                        post_only=True,
+                                        reduceOnly=True,
+                                    )
+                            else:
+                                result = await self.extended_client.place_order(
+                                    market_name=market_name,
+                                    amount_of_synthetic=Decimal(str(rounded_size)),
+                                    price=Decimal(str(rounded_price)),
+                                    side=order_side,
+                                    post_only=True,
+                                )
                             self._verbose_log(f"    Method 1 (direct + post_only) succeeded")
                         except TypeError as e:
                             self._verbose_log(f"    Method 1 failed: {e}")
@@ -2473,25 +2502,75 @@ class GridCopyTerminal:
                             # Method 2: orders module with post_only
                             try:
                                 side_str = 'BUY' if side == 'BUY' else 'SELL'
-                                result = await self.extended_client.orders.place_order(
-                                    market=market_name,
-                                    side=side_str,
-                                    size=str(rounded_size),
-                                    price=str(rounded_price),
-                                    post_only=True,
-                                )
+                                if reduce_only:
+                                    try:
+                                        result = await self.extended_client.orders.place_order(
+                                            market=market_name,
+                                            side=side_str,
+                                            size=str(rounded_size),
+                                            price=str(rounded_price),
+                                            post_only=True,
+                                            reduce_only=True,
+                                        )
+                                    except TypeError:
+                                        result = await self.extended_client.orders.place_order(
+                                            market=market_name,
+                                            side=side_str,
+                                            size=str(rounded_size),
+                                            price=str(rounded_price),
+                                            post_only=True,
+                                            reduceOnly=True,
+                                        )
+                                else:
+                                    result = await self.extended_client.orders.place_order(
+                                        market=market_name,
+                                        side=side_str,
+                                        size=str(rounded_size),
+                                        price=str(rounded_price),
+                                        post_only=True,
+                                    )
                                 self._verbose_log(f"    Method 2 (orders module + post_only) succeeded")
                             except TypeError as e2:
                                 self._verbose_log(f"    Method 2 failed: {e2}")
                                 
                                 # Method 3: Direct client without post_only (fallback)
-                                result = await self.extended_client.place_order(
-                                    market_name=market_name,
-                                    amount_of_synthetic=Decimal(str(rounded_size)),
-                                    price=Decimal(str(rounded_price)),
-                                    side=order_side,
-                                )
-                                self._verbose_log(f"    Method 3 (no post_only) - WARNING: may fill as taker")
+                                try:
+                                    if reduce_only:
+                                        try:
+                                            result = await self.extended_client.place_order(
+                                                market_name=market_name,
+                                                amount_of_synthetic=Decimal(str(rounded_size)),
+                                                price=Decimal(str(rounded_price)),
+                                                side=order_side,
+                                                reduce_only=True,
+                                            )
+                                        except TypeError:
+                                            result = await self.extended_client.place_order(
+                                                market_name=market_name,
+                                                amount_of_synthetic=Decimal(str(rounded_size)),
+                                                price=Decimal(str(rounded_price)),
+                                                side=order_side,
+                                                reduceOnly=True,
+                                            )
+                                    else:
+                                        result = await self.extended_client.place_order(
+                                            market_name=market_name,
+                                            amount_of_synthetic=Decimal(str(rounded_size)),
+                                            price=Decimal(str(rounded_price)),
+                                            side=order_side,
+                                        )
+                                    self._verbose_log(f"    Method 3 (no post_only) - WARNING: may fill as taker")
+                                except TypeError as e3:
+                                    # reduce_only not supported - try without it
+                                    self._verbose_log(f"    Method 3 failed: {e3}")
+                                    self._verbose_log(f"    Method 4: Trying without reduce_only...")
+                                    result = await self.extended_client.place_order(
+                                        market_name=market_name,
+                                        amount_of_synthetic=Decimal(str(rounded_size)),
+                                        price=Decimal(str(rounded_price)),
+                                        side=order_side,
+                                    )
+                                    self._verbose_log(f"    Method 4 succeeded (no reduce_only)")
                         
                         self._verbose_log(f"    API Response: {result}")
                         

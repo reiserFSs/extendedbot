@@ -1645,8 +1645,20 @@ class GridCopyTerminal:
         if tp_threshold <= 0:
             return False
         
-        # If TP is already pending (being processed), skip
+        # If TP is already pending, check if we should cancel it (price moved against us)
         if self.take_profit_pending:
+            # Check if position is now at a loss - cancel stale TP order
+            position = self.current_position
+            self._update_local_pnl()
+            
+            if position.get('unrealized_pnl', 0) < 0 and self.take_profit_order_id:
+                self._debug_log(f"STALE TP: Position now at loss (${position['unrealized_pnl']:.2f}), cancelling TP order")
+                try:
+                    await self.cancel_order(self.take_profit_order_id)
+                    self.log_activity("TP", self.watch_token, "Cancelled (price moved)", "skip")
+                except Exception as e:
+                    self._debug_log(f"  Cancel error: {e}")
+                self._reset_tp_state()
             return False
         
         # Update PnL locally using orderbook (fast, every loop iteration)
@@ -3526,6 +3538,17 @@ class GridCopyTerminal:
             
             # Cleanup - cancel all our orders
             self.console.print("\n[yellow]Cleaning up - cancelling all orders...[/yellow]")
+            
+            # Cancel any pending TP order first
+            if self.take_profit_order_id:
+                try:
+                    self.console.print(f"[yellow]Cancelling TP order {self.take_profit_order_id[:8]}...[/yellow]")
+                    await self.cancel_order(self.take_profit_order_id)
+                    self.take_profit_order_id = None
+                except Exception as e:
+                    self._debug_log(f"TP cancel error: {e}")
+            
+            # Cancel all grid orders
             for our_id in list(self.our_orders.keys()):
                 try:
                     await self.cancel_order(our_id)

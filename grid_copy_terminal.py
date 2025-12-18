@@ -926,26 +926,71 @@ class GridCopyTerminal:
     async def _start_orderbook_websocket(self, market_name: str):
         """Start WebSocket stream for real-time orderbook updates (10ms best bid/ask)"""
         
-        # Try different URL formats
-        urls_to_try = [
-            # Format 1: With stream.extended.exchange path prefix
-            f"wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks/{market_name}?depth=1",
-            # Format 2: Without market (all markets)
-            f"wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks?depth=1",
-            # Format 3: Direct path
-            f"wss://api.starknet.extended.exchange/v1/orderbooks/{market_name}?depth=1",
+        # Extended uses specific market format - try variations
+        # e.g., XRP-USD, XRPUSD, xrp-usd
+        market_variations = [
+            market_name,
+            market_name.replace('-', ''),  # XRPUSD
+            market_name.lower(),            # xrp-usd
+            market_name.lower().replace('-', ''),  # xrpusd
         ]
         
-        for ws_url in urls_to_try:
-            self._debug_log(f"ORDERBOOK WS: Trying {ws_url}")
+        # URL formats to try based on Extended docs
+        base_urls = [
+            "wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks",
+        ]
+        
+        for base_url in base_urls:
+            for market_var in market_variations:
+                # Try with specific market
+                ws_url = f"{base_url}/{market_var}?depth=1"
+                self._debug_log(f"ORDERBOOK WS: Trying {ws_url}")
+                
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.ws_connect(ws_url, heartbeat=10, timeout=aiohttp.ClientTimeout(total=5)) as ws:
+                            self.orderbook_ws = ws
+                            self.orderbook_ws_connected = True
+                            self._debug_log(f"ORDERBOOK WS: Connected to {ws_url}")
+                            
+                            async for msg in ws:
+                                if not self.is_running:
+                                    break
+                                    
+                                if msg.type == aiohttp.WSMsgType.TEXT:
+                                    try:
+                                        data = json.loads(msg.data)
+                                        self._process_orderbook_message(market_name, data)
+                                    except json.JSONDecodeError:
+                                        pass
+                                elif msg.type == aiohttp.WSMsgType.PING:
+                                    await ws.pong(msg.data)
+                                elif msg.type == aiohttp.WSMsgType.ERROR:
+                                    self._debug_log(f"ORDERBOOK WS ERROR: {ws.exception()}")
+                                    break
+                                elif msg.type == aiohttp.WSMsgType.CLOSED:
+                                    self._debug_log(f"ORDERBOOK WS: Closed")
+                                    break
+                            
+                            return  # Connected successfully, exit on disconnect
+                            
+                except aiohttp.ClientResponseError as e:
+                    self._debug_log(f"ORDERBOOK WS {ws_url}: HTTP {e.status}")
+                    continue
+                except Exception as e:
+                    self._debug_log(f"ORDERBOOK WS {ws_url}: {type(e).__name__}: {e}")
+                    continue
+            
+            # Also try without specific market (all markets stream)
+            ws_url = f"{base_url}?depth=1"
+            self._debug_log(f"ORDERBOOK WS: Trying all-markets stream {ws_url}")
             
             try:
                 async with aiohttp.ClientSession() as session:
-                    # heartbeat=10 handles ping/pong automatically
-                    async with session.ws_connect(ws_url, heartbeat=10) as ws:
+                    async with session.ws_connect(ws_url, heartbeat=10, timeout=aiohttp.ClientTimeout(total=5)) as ws:
                         self.orderbook_ws = ws
                         self.orderbook_ws_connected = True
-                        self._debug_log(f"ORDERBOOK WS: Connected to {ws_url}")
+                        self._debug_log(f"ORDERBOOK WS: Connected to all-markets stream")
                         
                         async for msg in ws:
                             if not self.is_running:
@@ -954,28 +999,21 @@ class GridCopyTerminal:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
                                     data = json.loads(msg.data)
-                                    # If subscribing to all markets, filter for our market
                                     self._process_orderbook_message(market_name, data)
                                 except json.JSONDecodeError:
                                     pass
                             elif msg.type == aiohttp.WSMsgType.PING:
                                 await ws.pong(msg.data)
-                            elif msg.type == aiohttp.WSMsgType.ERROR:
-                                self._debug_log(f"ORDERBOOK WS ERROR: {ws.exception()}")
-                                break
-                            elif msg.type == aiohttp.WSMsgType.CLOSED:
-                                self._debug_log(f"ORDERBOOK WS: Closed")
+                            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                                 break
                         
-                        # If we got here, connection worked - return to reconnect loop
                         return
                         
             except Exception as e:
-                self._debug_log(f"ORDERBOOK WS EXCEPTION for {ws_url}: {e}")
-                continue  # Try next URL
+                self._debug_log(f"ORDERBOOK WS all-markets: {type(e).__name__}: {e}")
         
-        # All URLs failed
-        self._debug_log("ORDERBOOK WS: All URL formats failed")
+        # All attempts failed
+        self._debug_log("ORDERBOOK WS: All connection attempts failed")
         self.orderbook_ws_connected = False
         self.orderbook_ws = None
     
@@ -1028,7 +1066,7 @@ class GridCopyTerminal:
     async def _orderbook_websocket_loop(self, market_name: str):
         """Maintain orderbook WebSocket connection with auto-reconnect and REST fallback"""
         ws_fail_count = 0
-        max_ws_failures = 5  # After this many failures, use REST polling
+        max_ws_failures = 3  # After 3 failures, use REST polling
         
         while self.is_running:
             try:
@@ -1040,12 +1078,12 @@ class GridCopyTerminal:
             
             if self.is_running:
                 if ws_fail_count >= max_ws_failures:
-                    # Fall back to REST polling
-                    self._debug_log(f"ORDERBOOK: WS failed {ws_fail_count} times, using REST fallback")
+                    # Fall back to REST polling - faster refresh rate
+                    self._debug_log(f"ORDERBOOK: Using REST fallback (poll every 1s)")
                     await self._fetch_orderbook_rest(market_name)
-                    await asyncio.sleep(2.0)  # Poll every 2s via REST
+                    await asyncio.sleep(1.0)  # Poll every 1s via REST for better accuracy
                 else:
-                    self._debug_log("ORDERBOOK WS: Reconnecting in 1s...")
+                    self._debug_log(f"ORDERBOOK WS: Reconnecting in 1s... (attempt {ws_fail_count}/{max_ws_failures})")
                     await asyncio.sleep(1.0)
     
     def _adjust_price_for_maker(self, price: float, side: str, best_bid: float, best_ask: float, tick_size: float) -> float:
@@ -1392,11 +1430,12 @@ class GridCopyTerminal:
             self.log_activity("CANCEL", self.watch_token, error_msg[:50], "error")
             return False
     
-    async def sync_orders(self):
+    async def sync_orders(self, parallel: bool = True):
         """
         Backup sync logic - REST poll to catch anything WebSocket missed.
         
-        WebSocket handles real-time updates, this runs every ~10s as verification.
+        Args:
+            parallel: If True, place new orders in parallel for speed
         """
         # Fetch current balance
         await self.fetch_balance()
@@ -1418,16 +1457,17 @@ class GridCopyTerminal:
             self.margin_failed_targets.clear()
             self.last_balance_for_retry = self.available_balance
         
-        # 1. Place orders for new target orders
+        # 1. Collect orders to place
+        orders_to_place = []
         for target_id, target_order in target_orders.items():
             if target_id not in self.order_mapping:
-                # Skip if previously failed due to margin (unless balance changed)
+                # Skip if previously failed due to margin
                 if target_id in self.margin_failed_targets:
                     skipped_margin += 1
                     continue
                 
                 # Check if we've hit max orders
-                if len(self.our_orders) >= self.config['max_open_orders']:
+                if len(self.our_orders) + len(orders_to_place) >= self.config['max_open_orders']:
                     skipped_max += 1
                     continue
                 
@@ -1435,39 +1475,27 @@ class GridCopyTerminal:
                 our_size = self.calculate_our_size(target_order['size'], target_order['price'])
                 
                 if our_size > 0:
-                    our_order_id = await self.place_order(
-                        coin=target_order['coin'],
-                        side=target_order['side'],
-                        size=our_size,
-                        price=target_order['price']
-                    )
-                    
-                    if our_order_id:
-                        # Track the mapping and our order
-                        self.order_mapping[target_id] = our_order_id
-                        self.our_orders[our_order_id] = {
-                            'id': our_order_id,
-                            'coin': target_order['coin'],
-                            'side': target_order['side'],
-                            'size': our_size,
-                            'price': target_order['price'],
-                            'value': our_size * target_order['price'],
-                            'target_id': target_id
-                        }
-                        actions_taken += 1
-                    else:
-                        # Mark as margin-failed if that was the error
-                        # (The place_order function logs the error type)
-                        self.margin_failed_targets.add(target_id)
-                        self.last_balance_for_retry = self.available_balance
-                    
-                    # Small delay to avoid rate limiting
-                    # await asyncio.sleep(0.05)  # Rate limit disabled
+                    orders_to_place.append({
+                        'target_id': target_id,
+                        'target_order': target_order,
+                        'our_size': our_size
+                    })
                 else:
                     skipped_size += 1
         
         if skipped_max > 0 or skipped_size > 0 or skipped_margin > 0:
             self._debug_log(f"SYNC: Skipped - max:{skipped_max}, size:{skipped_size}, margin:{skipped_margin}")
+        
+        # Place orders (parallel or sequential)
+        if orders_to_place:
+            if parallel and len(orders_to_place) > 1:
+                placed = await self._place_orders_parallel(orders_to_place)
+                actions_taken += placed
+            else:
+                for order_info in orders_to_place:
+                    result = await self._place_single_order(order_info)
+                    if result:
+                        actions_taken += 1
         
         # 2. Cancel orders where target cancelled
         stale_mappings = []
@@ -1532,6 +1560,133 @@ class GridCopyTerminal:
         
         self.last_sync = time.time()
         return actions_taken
+    
+    async def _place_single_order(self, order_info: dict) -> bool:
+        """Place a single order and update tracking"""
+        target_id = order_info['target_id']
+        target_order = order_info['target_order']
+        our_size = order_info['our_size']
+        
+        our_order_id = await self.place_order(
+            coin=target_order['coin'],
+            side=target_order['side'],
+            size=our_size,
+            price=target_order['price']
+        )
+        
+        if our_order_id:
+            self.order_mapping[target_id] = our_order_id
+            self.our_orders[our_order_id] = {
+                'id': our_order_id,
+                'coin': target_order['coin'],
+                'side': target_order['side'],
+                'size': our_size,
+                'price': target_order['price'],
+                'value': our_size * target_order['price'],
+                'target_id': target_id
+            }
+            return True
+        else:
+            self.margin_failed_targets.add(target_id)
+            self.last_balance_for_retry = self.available_balance
+            return False
+    
+    async def _place_orders_parallel(self, orders_to_place: list, batch_size: int = 10) -> int:
+        """Place multiple orders in parallel batches for speed"""
+        self._debug_log(f"PARALLEL: Placing {len(orders_to_place)} orders in batches of {batch_size}")
+        
+        total_placed = 0
+        
+        # Process in batches to avoid overwhelming the API
+        for i in range(0, len(orders_to_place), batch_size):
+            batch = orders_to_place[i:i + batch_size]
+            
+            # Create tasks for parallel execution
+            tasks = []
+            for order_info in batch:
+                task = asyncio.create_task(self._place_single_order(order_info))
+                tasks.append(task)
+            
+            # Wait for all in this batch to complete
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Count successes
+            for result in results:
+                if result is True:
+                    total_placed += 1
+                elif isinstance(result, Exception):
+                    self._debug_log(f"PARALLEL: Exception - {result}")
+        
+        self._debug_log(f"PARALLEL: Placed {total_placed}/{len(orders_to_place)} orders")
+        return total_placed
+    
+    async def place_initial_grid(self):
+        """
+        Pre-fetch and place entire grid at startup.
+        Much faster than waiting for WebSocket events.
+        """
+        self.console.print("[cyan]Fetching target grid...[/cyan]")
+        
+        # Fetch balance first
+        await self.fetch_balance()
+        
+        # Fetch all target orders
+        target_orders = await self.fetch_target_orders()
+        self.target_orders = target_orders
+        
+        if not target_orders:
+            self.console.print("[yellow]No target orders found[/yellow]")
+            return 0
+        
+        self.console.print(f"[cyan]Found {len(target_orders)} target orders[/cyan]")
+        
+        # Pre-compute precision specs for the token (avoid per-order lookups)
+        if self.watch_token:
+            self.console.print(f"[dim]Pre-computing precision specs for {self.watch_token}...[/dim]")
+            try:
+                specs = await self._get_precision_specs(self.watch_token)
+                self._debug_log(f"Pre-computed specs: {specs}")
+            except Exception as e:
+                self._debug_log(f"Precision pre-compute warning: {e}")
+        
+        # Pre-fetch orderbook for maker pricing
+        if self.watch_token:
+            market_name = self._get_extended_market(self.watch_token)
+            if market_name:
+                self.console.print(f"[dim]Fetching orderbook for maker pricing...[/dim]")
+                ob = await self._fetch_orderbook_rest(market_name)
+                if ob['best_bid'] > 0:
+                    self.console.print(f"[green]✓ Orderbook: bid=${ob['best_bid']:.4f}, ask=${ob['best_ask']:.4f}[/green]")
+        
+        # Collect orders to place
+        orders_to_place = []
+        for target_id, target_order in target_orders.items():
+            if len(orders_to_place) >= self.config['max_open_orders']:
+                break
+            
+            our_size = self.calculate_our_size(target_order['size'], target_order['price'])
+            if our_size > 0:
+                orders_to_place.append({
+                    'target_id': target_id,
+                    'target_order': target_order,
+                    'our_size': our_size
+                })
+        
+        if not orders_to_place:
+            self.console.print("[yellow]No valid orders to place (check sizing config)[/yellow]")
+            return 0
+        
+        # Place all orders in parallel
+        self.console.print(f"[cyan]Placing {len(orders_to_place)} orders in parallel...[/cyan]")
+        start_time = time.time()
+        
+        placed = await self._place_orders_parallel(orders_to_place, batch_size=10)
+        
+        elapsed = time.time() - start_time
+        rate = placed / elapsed if elapsed > 0 else 0
+        self.console.print(f"[green]✓ Placed {placed}/{len(orders_to_place)} orders in {elapsed:.1f}s ({rate:.1f}/s)[/green]")
+        
+        return placed
     
     def log_activity(self, action: str, coin: str, details: str, status: str):
         """Log activity for UI display"""
@@ -1836,12 +1991,12 @@ class GridCopyTerminal:
         else:
             self.console.print(f"[green]✓ Available balance: ${self.available_balance:.2f}[/green]")
         
-        # Do initial REST sync to get current orders
-        self.console.print("[dim]Fetching initial orders...[/dim]")
+        # Pre-fetch and place entire grid at startup (FAST - parallel placement)
         try:
-            await self.sync_orders()
+            await self.place_initial_grid()
         except Exception as e:
-            self.console.print(f"[yellow]Initial sync warning: {e}[/yellow]")
+            self.console.print(f"[yellow]Initial grid warning: {e}[/yellow]")
+            self._debug_log(f"Initial grid error: {e}")
         
         layout = self.create_layout()
         

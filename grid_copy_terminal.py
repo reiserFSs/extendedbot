@@ -1119,6 +1119,8 @@ class GridCopyTerminal:
     def _update_local_pnl(self):
         """Update unrealized PnL locally using orderbook price (fast, no API call)"""
         if self.current_position['size'] == 0 or self.current_position['entry_price'] == 0:
+            # Update side to None if position is flat
+            self.current_position['side'] = None
             return
         
         market_name = self._get_extended_market(self.watch_token)
@@ -1128,6 +1130,9 @@ class GridCopyTerminal:
         cached_ob = self.orderbook_cache.get(market_name, {})
         size = self.current_position['size']
         entry_price = self.current_position['entry_price']
+        
+        # Update side based on current size (position can flip)
+        self.current_position['side'] = 'LONG' if size > 0 else 'SHORT'
         
         # Use bid for longs (what we'd get if we sell), ask for shorts
         if size > 0:
@@ -1168,6 +1173,10 @@ class GridCopyTerminal:
         
         # Skip if no position
         if position['size'] == 0 or position['side'] is None:
+            return False
+        
+        # NEVER place take-profit on negative PnL
+        if position['unrealized_pnl'] < 0:
             return False
         
         # Check if unrealized profit exceeds threshold
@@ -1273,10 +1282,21 @@ class GridCopyTerminal:
             return False
     
     async def _clear_take_profit_pending(self):
-        """Clear take-profit pending flag after timeout (fallback if fill check misses it)"""
-        await asyncio.sleep(30.0)  # Wait longer for fill verification to catch it
+        """Clear take-profit pending flag after timeout and cancel unfilled order"""
+        await asyncio.sleep(30.0)  # Wait for fill verification to catch it
         if self.take_profit_pending:
-            self._debug_log(f"TAKE-PROFIT TIMEOUT: Resetting pending state (fill not confirmed)")
+            self._debug_log(f"TAKE-PROFIT TIMEOUT: Order not filled, cancelling...")
+            
+            # Cancel the unfilled TP order
+            if self.take_profit_order_id:
+                try:
+                    await self.cancel_order(self.take_profit_order_id)
+                    self.log_activity("TP", self.watch_token, "Cancelled (unfilled)", "skip")
+                    self._debug_log(f"TAKE-PROFIT CANCELLED: {self.take_profit_order_id}")
+                except Exception as e:
+                    self._debug_log(f"TAKE-PROFIT CANCEL ERROR: {e}")
+            
+            # Reset pending state
             self.take_profit_pending = False
             self.take_profit_order_id = None
             self.pending_tp_profit = 0.0

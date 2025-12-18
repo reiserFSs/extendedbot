@@ -445,6 +445,8 @@ class GridCopyTerminal:
             self._debug_log(f"LEVERAGE ERROR: {e}")
             self.console.print(f"[yellow]⚠ Leverage setting failed: {e}[/yellow]")
             return False
+    
+    async def _setup_websocket(self):
         """Set up WebSocket connection to Hyperliquid for real-time order updates"""
         try:
             base_url = constants.MAINNET_API_URL

@@ -97,6 +97,12 @@ class GridCopyTerminal:
         self.watch_token = None
         self.ws_connected = False
         
+        # Balance tracking
+        self.available_balance = 0.0
+        self.total_balance = 0.0
+        self.last_balance_fetch = 0
+        self.balance_fetch_interval = 5.0  # Refresh balance every 5s
+        
         # Order tracking
         self.target_orders: Dict[str, Dict] = {}  # order_id -> order_info
         self.our_orders: Dict[str, Dict] = {}     # our_order_id -> order_info
@@ -207,6 +213,9 @@ class GridCopyTerminal:
         self.console.print("\n[bold]Safety Limits[/bold]")
         config['max_open_orders'] = int(input("Max Open Orders (default 20): ").strip() or "20")
         config['min_order_value'] = float(input("Min Order Value USD (default 5): ").strip() or "5")
+        
+        self.console.print("[dim]Max % of balance per order (prevents over-allocation)[/dim]")
+        config['max_order_percent'] = float(input("Max Order % of Balance (default 10): ").strip() or "10")
         
         # Network
         config['use_testnet'] = input("Use Testnet? (y/N): ").strip().lower() == 'y'
@@ -444,6 +453,9 @@ class GridCopyTerminal:
             self._debug_log(f"  Status=open, was_new={was_new}")
             
             if was_new and oid not in self.order_mapping:
+                # Fetch balance before placing order
+                await self.fetch_balance()
+                
                 # New order - place our matching order
                 our_size = self.calculate_our_size(size, price)
                 self._debug_log(f"  Calculated our_size={our_size}")
@@ -477,6 +489,9 @@ class GridCopyTerminal:
                         # Cancel and replace
                         await self.cancel_order(our_id)
                         del self.our_orders[our_id]
+                        
+                        # Fetch balance before placing replacement order
+                        await self.fetch_balance()
                         
                         our_size = self.calculate_our_size(size, price)
                         if our_size > 0:
@@ -646,13 +661,71 @@ class GridCopyTerminal:
         # Note: Orders get removed when cancelled or filled
         return self.our_orders.copy()
     
+    async def fetch_balance(self) -> float:
+        """Fetch available balance from Extended"""
+        try:
+            now = time.time()
+            # Use cached balance if recent enough
+            if now - self.last_balance_fetch < self.balance_fetch_interval and self.available_balance > 0:
+                return self.available_balance
+            
+            balance = await self.extended_client.account.get_balance()
+            self._debug_log(f"BALANCE: Raw response: {balance}")
+            
+            if balance:
+                # Try to extract available balance
+                if hasattr(balance, 'available'):
+                    self.available_balance = float(balance.available)
+                elif hasattr(balance, 'data') and balance.data:
+                    if hasattr(balance.data, 'available'):
+                        self.available_balance = float(balance.data.available)
+                    elif hasattr(balance.data, 'free'):
+                        self.available_balance = float(balance.data.free)
+                elif isinstance(balance, dict):
+                    self.available_balance = float(balance.get('available', balance.get('free', 0)))
+                
+                # Also try total balance
+                if hasattr(balance, 'total'):
+                    self.total_balance = float(balance.total)
+                elif hasattr(balance, 'equity'):
+                    self.total_balance = float(balance.equity)
+                
+                self._debug_log(f"BALANCE: Available={self.available_balance}, Total={self.total_balance}")
+            
+            self.last_balance_fetch = now
+            return self.available_balance
+            
+        except Exception as e:
+            self._debug_log(f"BALANCE ERROR: {e}")
+            return self.available_balance  # Return cached value on error
+    
     def calculate_our_size(self, target_size: float, price: float) -> float:
-        """Calculate our order size based on target's size"""
+        """Calculate our order size based on target's size and our available balance"""
         target_value = target_size * price
-        our_value = target_value * self.config['size_percent']
+        
+        # Check if we have any balance
+        if self.available_balance <= 0:
+            self._debug_log(f"SIZE CALC: No available balance (${self.available_balance:.2f}), skipping")
+            return 0
+        
+        # Method 1: Proportional to target (size_percent)
+        scaled_value = target_value * self.config['size_percent']
+        
+        # Method 2: Cap at percentage of our available balance
+        max_order_pct = self.config.get('max_order_percent', 10)  # Default 10% of balance per order
+        balance_cap = self.available_balance * (max_order_pct / 100)
+        
+        # Use the smaller of the two
+        our_value = min(scaled_value, balance_cap)
+        
+        self._debug_log(f"SIZE CALC: avail_balance=${self.available_balance:.2f}, target_value=${target_value:.2f}")
+        self._debug_log(f"  scaled=${scaled_value:.2f} ({self.config['size_percent']*100:.3f}% of target)")
+        self._debug_log(f"  balance_cap=${balance_cap:.2f} ({max_order_pct}% of balance)")
+        self._debug_log(f"  final=${our_value:.2f}")
         
         # Check minimum
         if our_value < self.config['min_order_value']:
+            self._debug_log(f"SIZE CALC: ${our_value:.2f} < min ${self.config['min_order_value']}, skipping")
             return 0
         
         our_size = our_value / price
@@ -846,6 +919,9 @@ class GridCopyTerminal:
         
         WebSocket handles real-time updates, this runs every ~10s as verification.
         """
+        # Fetch current balance
+        await self.fetch_balance()
+        
         # Fetch target's current orders via REST
         target_orders = await self.fetch_target_orders()
         
@@ -1008,6 +1084,13 @@ class GridCopyTerminal:
         """Render stats panel"""
         text = Text()
         
+        # Balance
+        text.append(f"Available        ", style="white")
+        if self.available_balance > 0:
+            text.append(f"${self.available_balance:.2f}\n", style="green")
+        else:
+            text.append(f"${self.available_balance:.2f}\n", style="red")
+        
         # WebSocket status
         text.append(f"WebSocket        ", style="white")
         if self.ws_connected:
@@ -1044,6 +1127,9 @@ class GridCopyTerminal:
         
         text.append(f"Size Percent     ", style="white")
         text.append(f"{self.config['size_percent']*100:.3f}%\n", style="white")
+        
+        text.append(f"Max Order %      ", style="white")
+        text.append(f"{self.config.get('max_order_percent', 10)}%\n", style="white")
         
         return Panel(text, title="Stats", border_style="green")
     
@@ -1168,6 +1254,19 @@ class GridCopyTerminal:
         self.is_running = True
         self.start_time = time.time()
         self.pending_actions = asyncio.Queue()
+        
+        # Fetch initial balance
+        self.console.print("[dim]Checking balance...[/dim]")
+        await self.fetch_balance()
+        
+        if self.available_balance <= 0:
+            self.console.print(f"[red]⚠ No available balance (${self.available_balance:.2f})[/red]")
+            self.console.print("[yellow]Deposit funds to Extended DEX before running[/yellow]")
+            return
+        elif self.available_balance < self.config['min_order_value']:
+            self.console.print(f"[yellow]⚠ Low balance: ${self.available_balance:.2f} (min order: ${self.config['min_order_value']})[/yellow]")
+        else:
+            self.console.print(f"[green]✓ Available balance: ${self.available_balance:.2f}[/green]")
         
         # Do initial REST sync to get current orders
         self.console.print("[dim]Fetching initial orders...[/dim]")

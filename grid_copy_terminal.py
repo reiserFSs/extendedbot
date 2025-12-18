@@ -949,9 +949,10 @@ class GridCopyTerminal:
             if hasattr(self.extended_client, 'account') and hasattr(self.extended_client.account, 'get_positions'):
                 try:
                     positions = await self.extended_client.account.get_positions()
-                    self._verbose_log(f"POSITION: Raw response: {positions}")
+                    self._debug_log(f"POSITION: Raw response type: {type(positions)}")
+                    self._debug_log(f"POSITION: Raw response: {positions}")
                 except Exception as e:
-                    self._verbose_log(f"POSITION Method 1 failed: {e}")
+                    self._debug_log(f"POSITION Method 1 failed: {e}")
             
             # Method 2: positions.get_positions()
             if positions is None and hasattr(self.extended_client, 'positions'):
@@ -972,23 +973,53 @@ class GridCopyTerminal:
                     self._verbose_log(f"POSITION Method 3 failed: {e}")
             
             if positions:
+                self._debug_log(f"POSITION: Parsing positions, type: {type(positions)}")
+                
                 # Parse positions - look for our market
                 position_list = []
                 if hasattr(positions, 'data'):
-                    position_list = positions.data if isinstance(positions.data, list) else [positions.data]
+                    self._debug_log(f"POSITION: Has .data attr: {positions.data}")
+                    if positions.data is None:
+                        position_list = []
+                    elif isinstance(positions.data, list):
+                        position_list = positions.data
+                    else:
+                        position_list = [positions.data]
                 elif isinstance(positions, list):
                     position_list = positions
-                elif hasattr(positions, '__iter__'):
+                elif hasattr(positions, 'positions'):
+                    # Some APIs nest it
+                    position_list = positions.positions if isinstance(positions.positions, list) else [positions.positions]
+                elif hasattr(positions, '__iter__') and not isinstance(positions, (str, dict)):
                     position_list = list(positions)
+                else:
+                    # Treat the whole response as a single position
+                    position_list = [positions]
+                
+                self._debug_log(f"POSITION: Found {len(position_list)} positions to check")
                 
                 for pos in position_list:
+                    # Debug: Log all attributes of position object
+                    if hasattr(pos, '__dict__'):
+                        self._debug_log(f"POSITION obj attrs: {pos.__dict__}")
+                    else:
+                        self._debug_log(f"POSITION obj: {pos}, type: {type(pos)}")
+                    
+                    # Also try to get all attribute names
+                    all_attrs = [a for a in dir(pos) if not a.startswith('_')]
+                    self._debug_log(f"POSITION all attrs: {all_attrs}")
+                    
                     pos_market = None
                     if hasattr(pos, 'market'):
                         pos_market = pos.market
                     elif hasattr(pos, 'symbol'):
                         pos_market = pos.symbol
+                    elif hasattr(pos, 'name'):
+                        pos_market = pos.name
                     elif isinstance(pos, dict):
-                        pos_market = pos.get('market', pos.get('symbol', ''))
+                        pos_market = pos.get('market', pos.get('symbol', pos.get('name', '')))
+                    
+                    self._debug_log(f"POSITION market check: pos_market={pos_market}, looking for {market_name} or {self.watch_token}")
                     
                     if pos_market and (pos_market == market_name or self.watch_token in str(pos_market).upper()):
                         # Found our position
@@ -996,33 +1027,51 @@ class GridCopyTerminal:
                         entry_price = 0.0
                         unrealized_pnl = 0.0
                         
-                        # Extract size
-                        if hasattr(pos, 'size'):
-                            size = float(pos.size)
-                        elif hasattr(pos, 'quantity'):
-                            size = float(pos.quantity)
-                        elif hasattr(pos, 'amount'):
-                            size = float(pos.amount)
-                        elif isinstance(pos, dict):
-                            size = float(pos.get('size', pos.get('quantity', pos.get('amount', 0))))
+                        # Extract size - try many field names
+                        for attr in ['size', 'quantity', 'amount', 'position_size', 'qty', 'contracts']:
+                            if hasattr(pos, attr):
+                                val = getattr(pos, attr)
+                                if val is not None:
+                                    size = float(val)
+                                    self._debug_log(f"POSITION size from {attr}: {size}")
+                                    break
+                        if size == 0 and isinstance(pos, dict):
+                            for key in ['size', 'quantity', 'amount', 'position_size', 'qty', 'contracts']:
+                                if key in pos and pos[key]:
+                                    size = float(pos[key])
+                                    break
                         
-                        # Extract entry price
-                        if hasattr(pos, 'entry_price'):
-                            entry_price = float(pos.entry_price)
-                        elif hasattr(pos, 'avg_price'):
-                            entry_price = float(pos.avg_price)
-                        elif hasattr(pos, 'average_price'):
-                            entry_price = float(pos.average_price)
-                        elif isinstance(pos, dict):
-                            entry_price = float(pos.get('entry_price', pos.get('avg_price', pos.get('average_price', 0))))
+                        # Extract entry price - try many field names
+                        for attr in ['entry_price', 'avg_price', 'average_price', 'avgPrice', 'entryPrice', 
+                                     'open_price', 'openPrice', 'cost_basis', 'mark_price', 'price']:
+                            if hasattr(pos, attr):
+                                val = getattr(pos, attr)
+                                if val is not None and float(val) > 0:
+                                    entry_price = float(val)
+                                    self._debug_log(f"POSITION entry_price from {attr}: {entry_price}")
+                                    break
+                        if entry_price == 0 and isinstance(pos, dict):
+                            for key in ['entry_price', 'avg_price', 'average_price', 'avgPrice', 'entryPrice',
+                                        'open_price', 'openPrice', 'cost_basis', 'mark_price', 'price']:
+                                if key in pos and pos[key]:
+                                    entry_price = float(pos[key])
+                                    break
                         
-                        # Extract unrealized PnL if available
-                        if hasattr(pos, 'unrealized_pnl'):
-                            unrealized_pnl = float(pos.unrealized_pnl)
-                        elif hasattr(pos, 'pnl'):
-                            unrealized_pnl = float(pos.pnl)
-                        elif isinstance(pos, dict):
-                            unrealized_pnl = float(pos.get('unrealized_pnl', pos.get('pnl', 0)))
+                        # Extract unrealized PnL - try many field names
+                        for attr in ['unrealized_pnl', 'pnl', 'unrealizedPnl', 'uPnl', 'profit', 
+                                     'unrealized_profit', 'floating_pnl']:
+                            if hasattr(pos, attr):
+                                val = getattr(pos, attr)
+                                if val is not None:
+                                    unrealized_pnl = float(val)
+                                    self._debug_log(f"POSITION unrealized_pnl from {attr}: {unrealized_pnl}")
+                                    break
+                        if unrealized_pnl == 0 and isinstance(pos, dict):
+                            for key in ['unrealized_pnl', 'pnl', 'unrealizedPnl', 'uPnl', 'profit',
+                                        'unrealized_profit', 'floating_pnl']:
+                                if key in pos and pos[key]:
+                                    unrealized_pnl = float(pos[key])
+                                    break
                         
                         # Calculate unrealized PnL if not provided
                         if unrealized_pnl == 0 and size != 0 and entry_price > 0:

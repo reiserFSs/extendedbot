@@ -146,11 +146,27 @@ class GridCopyTerminal:
         }
         self.last_position_fetch = 0
         self.position_fetch_interval = 5.0  # Full API refresh every 5s
-        self.take_profit_pending = False    # Avoid duplicate TP orders
-        self.take_profit_order_id = None
-        self.pending_tp_profit = 0.0        # Expected profit from pending TP (not yet confirmed)
-        self.pre_tp_position_size = 0.0     # Position size before TP order (to detect close)
-        self.total_realized_pnl = 0.0       # Track cumulative CONFIRMED profit
+        
+        # Session P&L tracking (for total P&L based TP)
+        self.session_start_balance = 0.0     # Balance when session started
+        self.session_grid_realized_pnl = 0.0 # Realized P&L from grid fills (not TP)
+        self.last_tracked_size = 0.0         # For detecting grid fills
+        self.last_tracked_entry = 0.0        # Entry price before fill
+        
+        # Trailing Take-Profit state
+        self.tp_active = False              # TP mode is active
+        self.tp_order_id = None             # Current TP order ID
+        self.tp_order_price = 0.0           # Current TP order price
+        self.tp_order_side = None           # 'BUY' or 'SELL'
+        self.tp_order_size = 0.0            # Size of TP order
+        self.tp_entry_price = 0.0           # Entry price when TP triggered
+        self.tp_start_time = 0.0            # When TP was triggered
+        self.tp_best_price = 0.0            # Best price seen since TP triggered
+        self.tp_trail_threshold = 0.0003    # Trail if price improves 0.03%
+        self.tp_timeout = 30.0              # Max seconds before market close
+        self.tp_last_update = 0.0           # Last time we updated TP order
+        self.pending_tp_profit = 0.0        # Expected profit from pending TP
+        self.total_realized_pnl = 0.0       # Track cumulative CONFIRMED TP profit
         
         # Target position tracking (from Hyperliquid WebSocket)
         self.target_position: Dict = {
@@ -1585,10 +1601,67 @@ class GridCopyTerminal:
                             'side': final_side,
                         }
                         
+                        # Track grid fills (position size changes NOT from TP)
+                        # This estimates realized P&L from grid order fills
+                        if not self.tp_active and self.last_tracked_size != 0:
+                            old_size = abs(self.last_tracked_size)
+                            new_size = abs(size)
+                            old_side = 'LONG' if self.last_tracked_size > 0 else 'SHORT'
+                            new_side = final_side
+                            
+                            # Direction flip - old position fully closed
+                            if old_side != new_side and new_side is not None:
+                                # Closed entire old position
+                                cached_ob = self.orderbook_cache.get(market_name, {})
+                                if self.last_tracked_entry > 0:
+                                    if old_side == 'LONG':
+                                        fill_price = cached_ob.get('best_bid', entry_price)
+                                        realized = (fill_price - self.last_tracked_entry) * old_size
+                                    else:  # Was SHORT
+                                        fill_price = cached_ob.get('best_ask', entry_price)
+                                        realized = (self.last_tracked_entry - fill_price) * old_size
+                                    
+                                    self.session_grid_realized_pnl += realized
+                                    self._debug_log(f"DIRECTION FLIP: {old_side} -> {new_side}")
+                                    self._debug_log(f"  Closed {old_size:.4f} @ ${fill_price:.4f}")
+                                    self._debug_log(f"  Realized P&L: ${realized:.4f} (session total: ${self.session_grid_realized_pnl:.4f})")
+                            
+                            # Same direction - position reduced (partial close from grid fill)
+                            elif new_size < old_size * 0.99:  # 1% threshold to avoid noise
+                                filled_size = old_size - new_size
+                                
+                                # Estimate realized P&L from this fill
+                                cached_ob = self.orderbook_cache.get(market_name, {})
+                                
+                                if self.last_tracked_entry > 0:
+                                    if old_side == 'LONG':
+                                        # Was LONG, sold some - fill price ~= bid
+                                        fill_price = cached_ob.get('best_bid', entry_price)
+                                        realized = (fill_price - self.last_tracked_entry) * filled_size
+                                    else:
+                                        # Was SHORT, bought some - fill price ~= ask
+                                        fill_price = cached_ob.get('best_ask', entry_price)
+                                        realized = (self.last_tracked_entry - fill_price) * filled_size
+                                    
+                                    self.session_grid_realized_pnl += realized
+                                    self._debug_log(f"GRID FILL DETECTED: size {old_size:.4f} -> {new_size:.4f}")
+                                    self._debug_log(f"  Estimated fill: {filled_size:.4f} @ ${fill_price:.4f}")
+                                    self._debug_log(f"  Realized P&L: ${realized:.4f} (session total: ${self.session_grid_realized_pnl:.4f})")
+                        
+                        # Update tracking for next comparison
+                        self.last_tracked_size = size
+                        self.last_tracked_entry = entry_price
+                        
                         self._debug_log(f"POSITION FINAL: {self.current_position}")
                         break
                 else:
-                    # No position found for this market
+                    # No position found for this market - reset session P&L tracking
+                    if self.last_tracked_size != 0:
+                        self._debug_log(f"POSITION FLAT: Resetting session grid realized (was ${self.session_grid_realized_pnl:.4f})")
+                        self.session_grid_realized_pnl = 0.0
+                        self.last_tracked_size = 0.0
+                        self.last_tracked_entry = 0.0
+                    
                     self.current_position = {
                         'size': 0.0,
                         'entry_price': 0.0,
@@ -1638,315 +1711,351 @@ class GridCopyTerminal:
             self.current_position['unrealized_pnl_pct'] = pnl_pct
     
     async def check_and_execute_take_profit(self) -> bool:
-        """Check if take-profit should trigger and execute if so"""
+        """
+        Trailing Take-Profit Logic:
+        1. If not active: Check if we should trigger TP
+        2. If active: Manage trailing (update order if price improves, cancel if loss, market if timeout)
+        """
         tp_threshold = self.config.get('take_profit_percent', 0)
         
         # Skip if take-profit disabled
         if tp_threshold <= 0:
             return False
         
-        # If TP is already pending, check if we should cancel it (price moved against us)
-        if self.take_profit_pending:
-            # Check if position is now at a loss - cancel stale TP order
-            position = self.current_position
-            self._update_local_pnl()
-            
-            if position.get('unrealized_pnl', 0) < 0 and self.take_profit_order_id:
-                self._debug_log(f"STALE TP: Position now at loss (${position['unrealized_pnl']:.2f}), cancelling TP order")
-                try:
-                    await self.cancel_order(self.take_profit_order_id)
-                    self.log_activity("TP", self.watch_token, "Cancelled (price moved)", "skip")
-                except Exception as e:
-                    self._debug_log(f"  Cancel error: {e}")
-                self._reset_tp_state()
-            return False
-        
-        # Update PnL locally using orderbook (fast, every loop iteration)
+        # Update PnL locally using orderbook
         self._update_local_pnl()
         
-        # Periodically fetch full position from API to sync entry price & size
-        now = time.time()
-        if now - self.last_position_fetch >= self.position_fetch_interval:
-            await self.fetch_position()
+        # Get current market data
+        market_name = self._get_extended_market(self.watch_token)
+        cached_ob = self.orderbook_cache.get(market_name, {}) if market_name else {}
+        best_bid = cached_ob.get('best_bid', 0)
+        best_ask = cached_ob.get('best_ask', 0)
+        
+        if best_bid <= 0 or best_ask <= 0:
+            return False
         
         position = self.current_position
+        now = time.time()
+        
+        # Periodically fetch full position from API
+        if now - self.last_position_fetch >= self.position_fetch_interval:
+            await self.fetch_position()
+            position = self.current_position
+        
+        # ===== TP ACTIVE: Manage trailing =====
+        if self.tp_active:
+            return await self._manage_trailing_tp(position, best_bid, best_ask, now)
+        
+        # ===== TP NOT ACTIVE: Check if we should trigger =====
         
         # Skip if no position
         if position['size'] == 0 or position['side'] is None:
             return False
         
-        # CRITICAL: Triple-check we're not at a loss
-        # Check 1: Raw PnL must be positive
-        if position['unrealized_pnl'] < 0:
+        # Calculate TOTAL PnL (unrealized + session grid realized)
+        notional = position.get('notional', 0)
+        if notional <= 0:
+            notional = abs(position['size'] * position['entry_price'])
+        
+        total_pnl = position['unrealized_pnl'] + self.session_grid_realized_pnl
+        total_pnl_pct = (total_pnl / notional * 100) if notional > 0 else 0
+        
+        # Skip if TOTAL not profitable
+        if total_pnl <= 0 or total_pnl_pct <= 0:
             return False
         
-        # Check 2: PnL percentage must be positive
-        if position['unrealized_pnl_pct'] < 0:
-            self._debug_log(f"TP SAFETY: PnL% negative ({position['unrealized_pnl_pct']:.3f}%), skipping")
-            return False
-        
-        # Check 3: Verify PnL calculation makes sense
-        # For LONG: current_price should be > entry_price
-        # For SHORT: current_price should be < entry_price
-        market_name = self._get_extended_market(self.watch_token)
-        cached_ob = self.orderbook_cache.get(market_name, {}) if market_name else {}
-        
+        # Verify price direction matches profit claim
         if position['side'] == 'LONG':
-            exit_price = cached_ob.get('best_bid', 0)
-            if exit_price > 0 and exit_price <= position['entry_price']:
-                self._debug_log(f"TP SAFETY: LONG but bid ${exit_price:.4f} <= entry ${position['entry_price']:.4f}, skipping")
+            if best_bid <= position['entry_price']:
                 return False
         elif position['side'] == 'SHORT':
-            exit_price = cached_ob.get('best_ask', 0)
-            if exit_price > 0 and exit_price >= position['entry_price']:
-                self._debug_log(f"TP SAFETY: SHORT but ask ${exit_price:.4f} >= entry ${position['entry_price']:.4f}, skipping")
+            if best_ask >= position['entry_price']:
                 return False
         
-        # Check if unrealized profit exceeds threshold
-        if position['unrealized_pnl_pct'] >= tp_threshold:
-            # Log full details before triggering
-            self._debug_log(f"TAKE-PROFIT TRIGGERED: {position['unrealized_pnl_pct']:.3f}% >= {tp_threshold:.3f}%")
+        # Check if TOTAL profit exceeds threshold
+        if total_pnl_pct >= tp_threshold:
+            # TRIGGER TP!
+            self._debug_log(f"TRAILING TP TRIGGERED: TOTAL {total_pnl_pct:.3f}% >= {tp_threshold:.3f}%")
+            self._debug_log(f"  Unrealized: ${position['unrealized_pnl']:.4f} ({position['unrealized_pnl_pct']:.3f}%)")
+            self._debug_log(f"  Grid Realized: ${self.session_grid_realized_pnl:.4f}")
+            self._debug_log(f"  TOTAL: ${total_pnl:.4f} ({total_pnl_pct:.3f}%)")
             self._debug_log(f"  Position: {position['side']} size={position['size']:.4f} entry=${position['entry_price']:.4f}")
-            self._debug_log(f"  Exit price: ${exit_price:.4f} (bid={cached_ob.get('best_bid', 0):.4f}, ask={cached_ob.get('best_ask', 0):.4f})")
-            self._debug_log(f"  PnL: ${position['unrealized_pnl']:.4f} ({position['unrealized_pnl_pct']:.3f}%)")
-            self.log_activity("TP", self.watch_token, f"Triggered @ {position['unrealized_pnl_pct']:.3f}%", "info")
+            self._debug_log(f"  Current: bid=${best_bid:.4f}, ask=${best_ask:.4f}")
+            self.log_activity("TP", self.watch_token, f"Trailing @ {total_pnl_pct:.3f}% (total)", "info")
             
-            # Store position size before TP to detect fill
-            self.pre_tp_position_size = abs(position['size'])
-            self.pending_tp_profit = position['unrealized_pnl']
+            # Initialize trailing TP state
+            self.tp_active = True
+            self.tp_entry_price = position['entry_price']
+            self.tp_order_size = abs(position['size'])
+            self.tp_start_time = now
+            self.tp_last_update = 0
             
-            # Place take-profit order
-            success = await self.place_take_profit_order(position)
-            return success
+            if position['side'] == 'LONG':
+                self.tp_order_side = 'SELL'
+                self.tp_best_price = best_bid
+            else:
+                self.tp_order_side = 'BUY'
+                self.tp_best_price = best_ask
+            
+            # Place initial TP order
+            return await self._place_or_update_tp_order(best_bid, best_ask)
         
         return False
     
-    async def place_take_profit_order(self, position: Dict) -> bool:
-        """Place a limit order to close the entire position at current price (with retry)"""
+    async def _manage_trailing_tp(self, position: Dict, best_bid: float, best_ask: float, now: float) -> bool:
+        """Manage active trailing TP - trail, cancel if loss, market if timeout"""
+        
+        # Check if position is closed (filled!)
+        current_size = abs(position.get('size', 0))
+        if current_size < self.tp_order_size * 0.1:  # 90%+ closed
+            # Calculate actual profit from TP fill
+            if self.tp_order_side == 'SELL':
+                tp_fill_pnl = (self.tp_order_price - self.tp_entry_price) * self.tp_order_size
+            else:
+                tp_fill_pnl = (self.tp_entry_price - self.tp_order_price) * self.tp_order_size
+            
+            # Total session profit = TP fill + grid realized losses/gains
+            total_session_pnl = tp_fill_pnl + self.session_grid_realized_pnl
+            
+            self._debug_log(f"TRAILING TP FILLED!")
+            self._debug_log(f"  TP fill P&L: ${tp_fill_pnl:.2f}")
+            self._debug_log(f"  Grid realized: ${self.session_grid_realized_pnl:.2f}")
+            self._debug_log(f"  Total session: ${total_session_pnl:.2f}")
+            
+            # Track total session profit (including grid losses)
+            self.total_realized_pnl += total_session_pnl
+            self.log_activity("TP", self.watch_token, f"Filled +${total_session_pnl:.2f} (session)", "success")
+            
+            # Reset grid realized since position is closed
+            self.session_grid_realized_pnl = 0.0
+            self.last_tracked_size = 0.0
+            self.last_tracked_entry = 0.0
+            
+            self._reset_tp_state()
+            return True
+        
+        # Check for partial fill - update remaining size
+        if current_size < self.tp_order_size * 0.9:
+            filled_size = self.tp_order_size - current_size
+            partial_pnl = filled_size * abs(self.tp_order_price - self.tp_entry_price)
+            if self.tp_order_side == 'SELL':
+                partial_pnl = (self.tp_order_price - self.tp_entry_price) * filled_size
+            else:
+                partial_pnl = (self.tp_entry_price - self.tp_order_price) * filled_size
+            
+            self._debug_log(f"TRAILING TP PARTIAL: {filled_size:.4f} filled, ${partial_pnl:.2f} realized")
+            self.total_realized_pnl += partial_pnl
+            self.tp_order_size = current_size  # Update to remaining size
+        
+        # Get current exit price
+        if self.tp_order_side == 'SELL':
+            current_exit = best_bid
+        else:
+            current_exit = best_ask
+        
+        # Check if we're now at a loss - ABORT
+        if self.tp_order_side == 'SELL' and current_exit <= self.tp_entry_price:
+            self._debug_log(f"TRAILING TP ABORT: bid ${current_exit:.4f} <= entry ${self.tp_entry_price:.4f}")
+            await self._cancel_tp_order()
+            self.log_activity("TP", self.watch_token, "Aborted (price reversed)", "skip")
+            self._reset_tp_state()
+            return False
+        
+        if self.tp_order_side == 'BUY' and current_exit >= self.tp_entry_price:
+            self._debug_log(f"TRAILING TP ABORT: ask ${current_exit:.4f} >= entry ${self.tp_entry_price:.4f}")
+            await self._cancel_tp_order()
+            self.log_activity("TP", self.watch_token, "Aborted (price reversed)", "skip")
+            self._reset_tp_state()
+            return False
+        
+        # Check timeout - switch to market order
+        elapsed = now - self.tp_start_time
+        if elapsed >= self.tp_timeout:
+            self._debug_log(f"TRAILING TP TIMEOUT: {elapsed:.1f}s elapsed, switching to market")
+            await self._cancel_tp_order()
+            return await self._place_market_tp_order(best_bid, best_ask)
+        
+        # Check if price improved - TRAIL!
+        price_improved = False
+        if self.tp_order_side == 'SELL' and current_exit > self.tp_best_price:
+            improvement = (current_exit - self.tp_best_price) / self.tp_best_price
+            if improvement >= self.tp_trail_threshold:
+                price_improved = True
+                self.tp_best_price = current_exit
+                self._debug_log(f"TRAILING TP: Price improved to ${current_exit:.4f} (+{improvement*100:.3f}%)")
+        
+        elif self.tp_order_side == 'BUY' and current_exit < self.tp_best_price:
+            improvement = (self.tp_best_price - current_exit) / self.tp_best_price
+            if improvement >= self.tp_trail_threshold:
+                price_improved = True
+                self.tp_best_price = current_exit
+                self._debug_log(f"TRAILING TP: Price improved to ${current_exit:.4f} (+{improvement*100:.3f}%)")
+        
+        # Update order if price improved (rate limit: once per second)
+        if price_improved and (now - self.tp_last_update) >= 1.0:
+            await self._cancel_tp_order()
+            await self._place_or_update_tp_order(best_bid, best_ask)
+            self.tp_last_update = now
+        
+        return True
+    
+    async def _place_or_update_tp_order(self, best_bid: float, best_ask: float) -> bool:
+        """Place or update the trailing TP limit order"""
         try:
-            # Safety check: Never TP at a loss
-            if position.get('unrealized_pnl', 0) < 0:
-                self._debug_log(f"TAKE-PROFIT ABORTED: PnL is negative (${position['unrealized_pnl']:.2f})")
-                self.take_profit_pending = False
+            # Determine price
+            if self.tp_order_side == 'SELL':
+                price = best_bid
+            else:
+                price = best_ask
+            
+            # Final safety check
+            if self.tp_order_side == 'SELL' and price <= self.tp_entry_price:
+                self._debug_log(f"TP ORDER SKIP: SELL price ${price:.4f} <= entry ${self.tp_entry_price:.4f}")
+                return False
+            if self.tp_order_side == 'BUY' and price >= self.tp_entry_price:
+                self._debug_log(f"TP ORDER SKIP: BUY price ${price:.4f} >= entry ${self.tp_entry_price:.4f}")
                 return False
             
-            self.take_profit_pending = True
-            
-            size = abs(position['size'])
-            entry_price = position['entry_price']
-            market_name = self._get_extended_market(self.watch_token)
-            
-            # Determine side (opposite of position)
-            if position['side'] == 'LONG':
-                close_side = 'SELL'
-            elif position['side'] == 'SHORT':
-                close_side = 'BUY'
+            # Calculate expected profit
+            if self.tp_order_side == 'SELL':
+                expected_pnl = (price - self.tp_entry_price) * self.tp_order_size
             else:
-                self._debug_log(f"TAKE-PROFIT ABORTED: Unknown position side ({position['side']})")
-                self.take_profit_pending = False
-                return False
+                expected_pnl = (self.tp_entry_price - price) * self.tp_order_size
             
-            self._debug_log(f"TAKE-PROFIT ORDER: {close_side} {size} (closing {position['side']})")
-            self._debug_log(f"  Entry was ${entry_price:.4f}, expected profit: ${position['unrealized_pnl']:.2f}")
+            # Include grid realized in pending profit for UI display
+            total_expected = expected_pnl + self.session_grid_realized_pnl
             
-            # Get current orderbook
-            cached_ob = self.orderbook_cache.get(market_name, {})
-            best_bid = cached_ob.get('best_bid', 0)
-            best_ask = cached_ob.get('best_ask', 0)
-            
-            # FINAL SANITY CHECK: Verify the exit price will result in profit
-            if position['side'] == 'LONG':
-                # To profit on LONG, we need to SELL above entry
-                if best_bid > 0 and best_bid <= entry_price:
-                    self._debug_log(f"TAKE-PROFIT ABORTED: LONG but best_bid ${best_bid:.4f} <= entry ${entry_price:.4f}")
-                    self._reset_tp_state()
-                    return False
-            elif position['side'] == 'SHORT':
-                # To profit on SHORT, we need to BUY below entry
-                if best_ask > 0 and best_ask >= entry_price:
-                    self._debug_log(f"TAKE-PROFIT ABORTED: SHORT but best_ask ${best_ask:.4f} >= entry ${entry_price:.4f}")
-                    self._reset_tp_state()
-                    return False
-            
-            # Step 1: Try limit order at best price (maker, 0% fee)
-            if close_side == 'SELL':
-                limit_price = best_bid if best_bid > 0 else entry_price * 1.005
-                expected_limit_pnl = (limit_price - entry_price) * size
-            else:
-                limit_price = best_ask if best_ask > 0 else entry_price * 0.995
-                expected_limit_pnl = (entry_price - limit_price) * size
-            
-            self._debug_log(f"  Step 1: Limit order @ ${limit_price:.4f} (expected PnL: ${expected_limit_pnl:.2f})")
+            self._debug_log(f"TP ORDER: {self.tp_order_side} {self.tp_order_size:.4f} @ ${price:.4f}")
+            self._debug_log(f"  Expected TP fill: ${expected_pnl:.2f}, Grid realized: ${self.session_grid_realized_pnl:.2f}, Total: ${total_expected:.2f}")
             
             order_id = await self.place_order(
                 coin=self.watch_token,
-                side=close_side,
-                size=size,
-                price=limit_price
+                side=self.tp_order_side,
+                size=self.tp_order_size,
+                price=price
             )
             
-            if not order_id:
-                self._debug_log(f"  Limit order failed, trying market directly...")
+            if order_id:
+                self.tp_order_id = order_id
+                self.tp_order_price = price
+                self.pending_tp_profit = total_expected  # Show total session profit
+                self.log_activity("TP", self.watch_token, f"Limit {self.tp_order_side} @ ${price:.4f}", "pending")
+                return True
             else:
-                self.take_profit_order_id = order_id
-                # Update pending profit to reflect limit price
-                self.pending_tp_profit = expected_limit_pnl
-                self.log_activity("TP", self.watch_token, f"Limit {close_side} @ ${limit_price:.4f}", "pending")
+                self._debug_log(f"TP ORDER FAILED")
+                return False
                 
-                # Step 2: Wait briefly for fill (2 seconds)
-                await asyncio.sleep(2.0)
-                
-                # Step 3: Check if position closed
-                self.last_position_fetch = 0  # Force refresh
-                await self.fetch_position()
-                
-                current_size = abs(self.current_position.get('size', 0))
-                if current_size < size * 0.1:  # 90%+ reduction = filled
-                    self._debug_log(f"  Limit order FILLED! Realized: ${self.pending_tp_profit:.2f}")
-                    self.total_realized_pnl += self.pending_tp_profit
-                    self.log_activity("TP", self.watch_token, f"Filled +${self.pending_tp_profit:.2f}", "success")
-                    self._reset_tp_state()
-                    return True
-                
-                # Step 4: Not filled → Cancel limit order
-                self._debug_log(f"  Limit not filled (size still {current_size:.4f}), cancelling...")
-                try:
-                    await self.cancel_order(order_id)
-                except Exception as e:
-                    self._debug_log(f"  Cancel error (may already be filled): {e}")
-                
-                # Check again after cancel (might have filled during cancel)
-                await asyncio.sleep(0.5)
-                self.last_position_fetch = 0
-                await self.fetch_position()
-                current_size = abs(self.current_position.get('size', 0))
-                if current_size < size * 0.1:
-                    self._debug_log(f"  Filled during cancel!")
-                    self.total_realized_pnl += self.pending_tp_profit
-                    self.log_activity("TP", self.watch_token, f"Filled +${self.pending_tp_profit:.2f}", "success")
-                    self._reset_tp_state()
-                    return True
-            
-            # Step 5: Market order (cross the spread, guaranteed fill)
-            # Refresh orderbook
-            cached_ob = self.orderbook_cache.get(market_name, {})
-            best_bid = cached_ob.get('best_bid', 0)
-            best_ask = cached_ob.get('best_ask', 0)
-            
+        except Exception as e:
+            self._debug_log(f"TP ORDER ERROR: {e}")
+            return False
+    
+    async def _place_market_tp_order(self, best_bid: float, best_ask: float) -> bool:
+        """Place market TP order (on timeout or when limit fails)"""
+        try:
             # Dynamic slippage based on TP target
-            # For small TP targets, use smaller slippage to preserve profit
             tp_threshold = self.config.get('take_profit_percent', 0.5)
-            # Slippage = 1/4 of TP threshold, capped between 0.01% and 0.1%
             slippage_pct = min(0.001, max(0.0001, tp_threshold / 100 / 4))
-            self._debug_log(f"  Using slippage: {slippage_pct*100:.3f}% (TP threshold: {tp_threshold}%)")
             
-            # Calculate market price WITH dynamic slippage buffer
-            if close_side == 'SELL':  # Closing LONG
-                # Sell into bids - use bid price with buffer below for guaranteed fill
-                market_price = best_bid * (1 - slippage_pct) if best_bid > 0 else entry_price * 0.995
-                
-                # CRITICAL: Check if market_price (with slippage) is still profitable
-                if market_price <= entry_price:
-                    self._debug_log(f"  Market order ABORTED: market_price ${market_price:.4f} <= entry ${entry_price:.4f}")
-                    self._debug_log(f"  (best_bid=${best_bid:.4f}, with {slippage_pct*100:.3f}% slippage = ${market_price:.4f})")
-                    self.log_activity("TP", self.watch_token, "Aborted - would close at loss", "skip")
+            if self.tp_order_side == 'SELL':
+                market_price = best_bid * (1 - slippage_pct)
+                # Check still profitable
+                if market_price <= self.tp_entry_price:
+                    self._debug_log(f"MARKET TP ABORT: price ${market_price:.4f} <= entry ${self.tp_entry_price:.4f}")
+                    self.log_activity("TP", self.watch_token, "Market abort (loss)", "skip")
                     self._reset_tp_state()
                     return False
-                    
-            else:  # Closing SHORT
-                # Buy into asks - use ask price with buffer above for guaranteed fill
-                market_price = best_ask * (1 + slippage_pct) if best_ask > 0 else entry_price * 1.005
-                
-                # CRITICAL: Check if market_price (with slippage) is still profitable
-                if market_price >= entry_price:
-                    self._debug_log(f"  Market order ABORTED: market_price ${market_price:.4f} >= entry ${entry_price:.4f}")
-                    self._debug_log(f"  (best_ask=${best_ask:.4f}, with {slippage_pct*100:.3f}% slippage = ${market_price:.4f})")
-                    self.log_activity("TP", self.watch_token, "Aborted - would close at loss", "skip")
+                expected_pnl = (market_price - self.tp_entry_price) * self.tp_order_size
+            else:
+                market_price = best_ask * (1 + slippage_pct)
+                # Check still profitable
+                if market_price >= self.tp_entry_price:
+                    self._debug_log(f"MARKET TP ABORT: price ${market_price:.4f} >= entry ${self.tp_entry_price:.4f}")
+                    self.log_activity("TP", self.watch_token, "Market abort (loss)", "skip")
                     self._reset_tp_state()
                     return False
+                expected_pnl = (self.tp_entry_price - market_price) * self.tp_order_size
             
-            # Calculate expected profit from this market order
-            expected_pnl = (market_price - entry_price) * size if close_side == 'SELL' else (entry_price - market_price) * size
+            self._debug_log(f"MARKET TP: {self.tp_order_side} {self.tp_order_size:.4f} @ ${market_price:.4f}")
+            self.log_activity("TP", self.watch_token, f"Market {self.tp_order_side} @ ${market_price:.4f}", "pending")
             
-            # Update pending profit to reflect actual market order price
-            self.pending_tp_profit = expected_pnl
-            
-            self._debug_log(f"  Step 5: Market order @ ${market_price:.4f} (expected PnL: ${expected_pnl:.2f})")
-            self.log_activity("TP", self.watch_token, f"Market {close_side} @ ${market_price:.4f}", "pending")
-            
-            # Remaining size (might have partially filled)
-            remaining_size = abs(self.current_position.get('size', size))
-            if remaining_size < 0.0001:
-                remaining_size = size  # Use original if position shows 0
-            
-            market_order_id = await self.place_order(
+            order_id = await self.place_order(
                 coin=self.watch_token,
-                side=close_side,
-                size=remaining_size,
+                side=self.tp_order_side,
+                size=self.tp_order_size,
                 price=market_price
             )
             
-            if market_order_id:
-                self.take_profit_order_id = market_order_id
+            if order_id:
+                self.tp_order_id = order_id
+                self.tp_order_price = market_price
+                # Include grid realized in pending profit
+                self.pending_tp_profit = expected_pnl + self.session_grid_realized_pnl
                 
-                # Wait for market order to fill
+                # Wait and verify
                 await asyncio.sleep(1.0)
-                
-                # Verify fill
                 self.last_position_fetch = 0
                 await self.fetch_position()
-                current_size = abs(self.current_position.get('size', 0))
                 
-                if current_size < remaining_size * 0.1:
-                    self._debug_log(f"  Market order FILLED! Realized: ${self.pending_tp_profit:.2f}")
-                    self.total_realized_pnl += self.pending_tp_profit
-                    self.log_activity("TP", self.watch_token, f"Filled +${self.pending_tp_profit:.2f}", "success")
+                current_size = abs(self.current_position.get('size', 0))
+                if current_size < self.tp_order_size * 0.1:
+                    # Total session profit = TP fill + grid realized
+                    total_session_pnl = expected_pnl + self.session_grid_realized_pnl
+                    
+                    self._debug_log(f"MARKET TP FILLED!")
+                    self._debug_log(f"  TP fill P&L: ${expected_pnl:.2f}")
+                    self._debug_log(f"  Grid realized: ${self.session_grid_realized_pnl:.2f}")
+                    self._debug_log(f"  Total session: ${total_session_pnl:.2f}")
+                    
+                    self.total_realized_pnl += total_session_pnl
+                    self.log_activity("TP", self.watch_token, f"Filled +${total_session_pnl:.2f} (session)", "success")
+                    
+                    # Reset grid realized since position is closed
+                    self.session_grid_realized_pnl = 0.0
+                    self.last_tracked_size = 0.0
+                    self.last_tracked_entry = 0.0
+                    
                     self._reset_tp_state()
                     return True
                 else:
-                    self._debug_log(f"  Market order may not have filled completely (size: {current_size})")
-                    # Start background check
-                    asyncio.create_task(self._verify_tp_fill_background())
+                    self._debug_log(f"MARKET TP may not have filled (size: {current_size})")
+                    # Keep TP active to monitor
                     return True
             else:
-                self._debug_log(f"  Market order FAILED")
-                self.log_activity("TP", self.watch_token, "Market order failed", "error")
+                self._debug_log(f"MARKET TP FAILED")
                 self._reset_tp_state()
                 return False
                 
         except Exception as e:
-            self._debug_log(f"TAKE-PROFIT ERROR: {e}")
+            self._debug_log(f"MARKET TP ERROR: {e}")
             self._reset_tp_state()
             return False
     
+    async def _cancel_tp_order(self) -> bool:
+        """Cancel current TP order"""
+        if self.tp_order_id:
+            try:
+                await self.cancel_order(self.tp_order_id)
+                self._debug_log(f"TP ORDER CANCELLED: {self.tp_order_id[:8]}...")
+                self.tp_order_id = None
+                return True
+            except Exception as e:
+                self._debug_log(f"TP CANCEL ERROR: {e}")
+                return False
+        return True
+    
     def _reset_tp_state(self):
         """Reset take-profit state variables"""
-        self.take_profit_pending = False
-        self.take_profit_order_id = None
+        self.tp_active = False
+        self.tp_order_id = None
+        self.tp_order_price = 0.0
+        self.tp_order_side = None
+        self.tp_order_size = 0.0
+        self.tp_entry_price = 0.0
+        self.tp_start_time = 0.0
+        self.tp_best_price = 0.0
+        self.tp_last_update = 0.0
         self.pending_tp_profit = 0.0
-        self.pre_tp_position_size = 0.0
         self.last_position_fetch = 0
-    
-    async def _verify_tp_fill_background(self):
-        """Background task to verify TP fill after a few seconds"""
-        await asyncio.sleep(5.0)
-        
-        if not self.take_profit_pending:
-            return
-        
-        self.last_position_fetch = 0
-        await self.fetch_position()
-        
-        current_size = abs(self.current_position.get('size', 0))
-        if current_size < self.pre_tp_position_size * 0.1:
-            self._debug_log(f"  Background check: TP FILLED!")
-            self.total_realized_pnl += self.pending_tp_profit
-            self.log_activity("TP", self.watch_token, f"Confirmed +${self.pending_tp_profit:.2f}", "success")
-        else:
-            self._debug_log(f"  Background check: Position still open ({current_size})")
-            self.log_activity("TP", self.watch_token, f"May not have filled", "warning")
-        
-        self._reset_tp_state()
     
     def calculate_our_size(self, target_size: float, price: float) -> float:
         """Calculate our order size based on target's size and our total balance"""
@@ -3121,13 +3230,34 @@ class GridCopyTerminal:
             else:
                 text.append(f"${pos['unrealized_pnl']:.2f} ({pos['unrealized_pnl_pct']:.2f}%)\n", style=pnl_color)
             
-            # Take-profit threshold
+            # Grid realized PnL (from fills during session)
+            if self.session_grid_realized_pnl != 0:
+                text.append(f"Grid Realized    ", style="white")
+                grid_color = "green" if self.session_grid_realized_pnl >= 0 else "red"
+                text.append(f"${self.session_grid_realized_pnl:.2f}\n", style=grid_color)
+            
+            # Total PnL (unrealized + grid realized) - this is what TP uses
+            total_pnl = pos['unrealized_pnl'] + self.session_grid_realized_pnl
+            total_pnl_pct = (total_pnl / pos_notional * 100) if pos_notional > 0 else 0
+            text.append(f"TOTAL PnL        ", style="white")
+            total_color = "green" if total_pnl >= 0 else "red"
+            if abs(total_pnl_pct) < 0.1:
+                text.append(f"${total_pnl:.2f} ({total_pnl_pct:.3f}%)\n", style=total_color)
+            else:
+                text.append(f"${total_pnl:.2f} ({total_pnl_pct:.2f}%)\n", style=total_color)
+            
+            # Take-profit threshold (now uses TOTAL PnL)
             tp_thresh = self.config.get('take_profit_percent', 0)
             if tp_thresh > 0:
                 text.append(f"Take-Profit      ", style="white")
-                if self.take_profit_pending:
-                    text.append(f"PENDING...\n", style="yellow")
-                elif pos['unrealized_pnl_pct'] >= tp_thresh * 0.8:  # 80% of threshold
+                if self.tp_active:
+                    # Show trailing status with current order price
+                    elapsed = time.time() - self.tp_start_time
+                    if self.tp_order_price > 0:
+                        text.append(f"TRAILING @ ${self.tp_order_price:.4f} ({elapsed:.0f}s)\n", style="yellow")
+                    else:
+                        text.append(f"TRAILING... ({elapsed:.0f}s)\n", style="yellow")
+                elif total_pnl_pct >= tp_thresh * 0.8:  # 80% of threshold (using TOTAL)
                     # Use appropriate precision for display
                     if tp_thresh < 0.1:
                         text.append(f"@ {tp_thresh:.2f}% (CLOSE)\n", style="yellow")
@@ -3540,11 +3670,11 @@ class GridCopyTerminal:
             self.console.print("\n[yellow]Cleaning up - cancelling all orders...[/yellow]")
             
             # Cancel any pending TP order first
-            if self.take_profit_order_id:
+            if self.tp_order_id:
                 try:
-                    self.console.print(f"[yellow]Cancelling TP order {self.take_profit_order_id[:8]}...[/yellow]")
-                    await self.cancel_order(self.take_profit_order_id)
-                    self.take_profit_order_id = None
+                    self.console.print(f"[yellow]Cancelling TP order {self.tp_order_id[:8]}...[/yellow]")
+                    await self.cancel_order(self.tp_order_id)
+                    self.tp_order_id = None
                 except Exception as e:
                     self._debug_log(f"TP cancel error: {e}")
             

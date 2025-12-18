@@ -705,12 +705,14 @@ class GridCopyTerminal:
             self._debug_log(f"TARGET POSITION REST ERROR: {e}")
             self.console.print(f"[yellow]⚠ Could not fetch target position: {e}[/yellow]")
     
-    def should_copy_order(self, order_side: str) -> bool:
+    def should_copy_order(self, order_side: str, order_price: float = 0) -> bool:
         """
         Check if an order should be copied based on position mirror settings.
+        Includes price-based take-profit detection.
         
         Args:
             order_side: 'BUY' or 'SELL'
+            order_price: Order price (used for TP detection)
         
         Returns:
             True if order should be copied, False if filtered out
@@ -721,7 +723,32 @@ class GridCopyTerminal:
         if self.copy_side_mode == "BOTH":
             return True
         
-        return order_side == self.copy_side_mode
+        target_entry = self.target_position.get('entry_price', 0)
+        target_side = self.target_position.get('side')
+        
+        if target_side == 'SHORT':
+            # Always copy SELL (adds to short)
+            if order_side == 'SELL':
+                return True
+            # Copy BUY only if price < entry (take profit to close short)
+            if order_side == 'BUY' and target_entry > 0 and order_price < target_entry:
+                self._verbose_log(f"  TP detected: BUY @ {order_price} < entry {target_entry}")
+                return True
+            # Skip BUY above entry (would be stop loss)
+            return False
+        
+        elif target_side == 'LONG':
+            # Always copy BUY (adds to long)
+            if order_side == 'BUY':
+                return True
+            # Copy SELL only if price > entry (take profit to close long)
+            if order_side == 'SELL' and target_entry > 0 and order_price > target_entry:
+                self._verbose_log(f"  TP detected: SELL @ {order_price} > entry {target_entry}")
+                return True
+            # Skip SELL below entry (would be stop loss)
+            return False
+        
+        return True  # FLAT - copy all
     
     async def _handle_order_event(self, message: Dict):
         """Handle real-time order event from WebSocket - queues for batch processing"""
@@ -846,7 +873,7 @@ class GridCopyTerminal:
                     return
                 
                 # Skip if filtered by position mirror
-                if not self.should_copy_order(order_record['side']):
+                if not self.should_copy_order(order_record['side'], price):
                     self._verbose_log(f"  Skipping: mirror filter ({self.copy_side_mode} only)")
                     self.orders_skipped_mirror += 1
                     return
@@ -2140,7 +2167,7 @@ class GridCopyTerminal:
                     continue
                 
                 # Skip if filtered by position mirror
-                if not self.should_copy_order(target_order['side']):
+                if not self.should_copy_order(target_order['side'], target_order['price']):
                     skipped_mirror += 1
                     continue
                 
@@ -2353,7 +2380,7 @@ class GridCopyTerminal:
                 break
             
             # Skip if filtered by position mirror
-            if not self.should_copy_order(target_order['side']):
+            if not self.should_copy_order(target_order['side'], target_order['price']):
                 skipped_mirror += 1
                 continue
             
@@ -2477,16 +2504,28 @@ class GridCopyTerminal:
                 target_color = "green" if target['side'] == 'LONG' else "red"
                 text.append(f"{target['side']} ", style=target_color)
                 text.append(f"{abs(target['size']):.2f}\n", style="cyan")
+                
+                # Show entry price
+                if target.get('entry_price', 0) > 0:
+                    text.append(f"Entry            ", style="white")
+                    text.append(f"${target['entry_price']:.4f}\n", style="dim")
             else:
                 text.append(f"Position         ", style="white")
                 text.append(f"FLAT\n", style="dim")
             
+            # Show copy mode with TP info
             text.append(f"Copy Mode        ", style="white")
             if self.copy_side_mode == "BOTH":
                 text.append(f"ALL\n", style="cyan")
             else:
                 mode_color = "green" if self.copy_side_mode == "BUY" else "red"
-                text.append(f"{self.copy_side_mode} only\n", style=mode_color)
+                entry = target.get('entry_price', 0)
+                if target['side'] == 'SHORT' and entry > 0:
+                    text.append(f"SELL + BUY<${entry:.2f}\n", style=mode_color)
+                elif target['side'] == 'LONG' and entry > 0:
+                    text.append(f"BUY + SELL>${entry:.2f}\n", style=mode_color)
+                else:
+                    text.append(f"{self.copy_side_mode} only\n", style=mode_color)
             
             if self.orders_skipped_mirror > 0:
                 text.append(f"Filtered         ", style="white")
@@ -2500,7 +2539,15 @@ class GridCopyTerminal:
             text.append(f"Position         ", style="white")
             side_color = "green" if pos['side'] == 'LONG' else "red"
             text.append(f"{pos['side']} ", style=side_color)
-            text.append(f"{abs(pos['size']):.4f}\n", style="cyan")
+            text.append(f"{abs(pos['size']):.4f}", style="cyan")
+            
+            # Show alignment with target if mirror mode enabled
+            if self.position_mirror_enabled and self.target_position.get('side'):
+                if pos['side'] == self.target_position['side']:
+                    text.append(f" ✓", style="green")
+                else:
+                    text.append(f" ✗ MISALIGNED", style="red")
+            text.append(f"\n", style="white")
             
             text.append(f"Entry Price      ", style="white")
             text.append(f"${pos['entry_price']:.4f}\n", style="dim")

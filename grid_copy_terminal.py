@@ -1041,9 +1041,9 @@ class GridCopyTerminal:
                                     size = float(pos[key])
                                     break
                         
-                        # Extract entry price - try many field names
-                        for attr in ['entry_price', 'avg_price', 'average_price', 'avgPrice', 'entryPrice', 
-                                     'open_price', 'openPrice', 'cost_basis', 'mark_price', 'price']:
+                        # Extract entry price - try many field names (open_price first for Extended)
+                        for attr in ['open_price', 'entry_price', 'avg_price', 'average_price', 'avgPrice', 'entryPrice', 
+                                     'openPrice', 'cost_basis', 'mark_price', 'price']:
                             if hasattr(pos, attr):
                                 val = getattr(pos, attr)
                                 if val is not None and float(val) > 0:
@@ -1051,14 +1051,14 @@ class GridCopyTerminal:
                                     self._debug_log(f"POSITION entry_price from {attr}: {entry_price}")
                                     break
                         if entry_price == 0 and isinstance(pos, dict):
-                            for key in ['entry_price', 'avg_price', 'average_price', 'avgPrice', 'entryPrice',
-                                        'open_price', 'openPrice', 'cost_basis', 'mark_price', 'price']:
+                            for key in ['open_price', 'entry_price', 'avg_price', 'average_price', 'avgPrice', 'entryPrice',
+                                        'openPrice', 'cost_basis', 'mark_price', 'price']:
                                 if key in pos and pos[key]:
                                     entry_price = float(pos[key])
                                     break
                         
-                        # Extract unrealized PnL - try many field names
-                        for attr in ['unrealized_pnl', 'pnl', 'unrealizedPnl', 'uPnl', 'profit', 
+                        # Extract unrealized PnL - try many field names (including British spelling)
+                        for attr in ['unrealised_pnl', 'unrealized_pnl', 'pnl', 'unrealizedPnl', 'uPnl', 'profit', 
                                      'unrealized_profit', 'floating_pnl']:
                             if hasattr(pos, attr):
                                 val = getattr(pos, attr)
@@ -1067,7 +1067,7 @@ class GridCopyTerminal:
                                     self._debug_log(f"POSITION unrealized_pnl from {attr}: {unrealized_pnl}")
                                     break
                         if unrealized_pnl == 0 and isinstance(pos, dict):
-                            for key in ['unrealized_pnl', 'pnl', 'unrealizedPnl', 'uPnl', 'profit',
+                            for key in ['unrealised_pnl', 'unrealized_pnl', 'pnl', 'unrealizedPnl', 'uPnl', 'profit',
                                         'unrealized_profit', 'floating_pnl']:
                                 if key in pos and pos[key]:
                                     unrealized_pnl = float(pos[key])
@@ -1093,7 +1093,7 @@ class GridCopyTerminal:
                             'side': 'LONG' if size > 0 else ('SHORT' if size < 0 else None),
                         }
                         
-                        self._verbose_log(f"POSITION: {self.current_position}")
+                        self._debug_log(f"POSITION FINAL: {self.current_position}")
                         break
                 else:
                     # No position found for this market

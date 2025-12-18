@@ -1984,7 +1984,8 @@ class GridCopyTerminal:
                 side=self.tp_order_side,
                 size=self.tp_order_size,
                 price=market_price,
-                reduce_only=True  # Close position, don't open new one
+                reduce_only=True,  # Close position, don't open new one
+                taker=True         # Skip maker adjustment, cross the spread
             )
             
             if order_id:
@@ -2365,11 +2366,12 @@ class GridCopyTerminal:
         
         return adjusted
     
-    async def place_order(self, coin: str, side: str, size: float, price: float, reduce_only: bool = False) -> Optional[str]:
+    async def place_order(self, coin: str, side: str, size: float, price: float, reduce_only: bool = False, taker: bool = False) -> Optional[str]:
         """Place a limit order on Extended with automatic precision learning
         
         Args:
             reduce_only: If True, order can only reduce position (for TP/SL orders)
+            taker: If True, skip maker adjustment to fill immediately (for market orders)
         """
         try:
             market_name = self._get_extended_market(coin)
@@ -2387,18 +2389,22 @@ class GridCopyTerminal:
             self._verbose_log(f"  Market: {market_name}")
             self._verbose_log(f"  Target price: {price}")
             
-            # Fetch orderbook and adjust price to ensure maker execution
+            # Fetch orderbook and adjust price
             orderbook = await self._fetch_orderbook(market_name)
             original_price = price
-            price = self._adjust_price_for_maker(
-                price, side, 
-                orderbook['best_bid'], 
-                orderbook['best_ask'],
-                initial_tick
-            )
             
-            if price != original_price:
-                self._verbose_log(f"  Adjusted price: {original_price} -> {price} (maker)")
+            # Skip maker adjustment for taker orders (we WANT to cross the spread)
+            if not taker:
+                price = self._adjust_price_for_maker(
+                    price, side, 
+                    orderbook['best_bid'], 
+                    orderbook['best_ask'],
+                    initial_tick
+                )
+                if price != original_price:
+                    self._verbose_log(f"  Adjusted price: {original_price} -> {price} (maker)")
+            else:
+                self._debug_log(f"  TAKER MODE: Skipping maker adjustment (price={price:.4f})")
             
             self._verbose_log(f"  Raw size: {size}, Final price: {price}")
             self._verbose_log(f"  Initial step: {initial_step}, Initial tick: {initial_tick}")

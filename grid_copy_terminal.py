@@ -172,6 +172,7 @@ class GridCopyTerminal:
         self.orders_filled = 0
         self.orders_skipped = 0  # Below min size
         self.orders_skipped_mirror = 0  # Filtered by position mirror
+        self.orders_skipped_max_position = 0  # Filtered by max position limit
         self.orders_failed = 0   # API errors
         self.orders_rejected_postonly = 0  # Post-only rejections (would have been taker)
         self.orders_rate_limited = 0  # Rate limit hits
@@ -292,6 +293,12 @@ class GridCopyTerminal:
         self.console.print("[dim]Auto-close position at X% unrealized profit (0 = disabled)[/dim]")
         self.console.print("[dim]Recommended: 0.4-0.5% to cover fees and lock profit[/dim]")
         config['take_profit_percent'] = float(input("Take-Profit % (default 0.5): ").strip() or "0.5")
+        
+        # Max position (inventory limit)
+        self.console.print("\n[bold]Max Position (Inventory Limit)[/bold]")
+        self.console.print("[dim]Maximum position notional value in USD (0 = unlimited)[/dim]")
+        self.console.print("[dim]When limit reached, only orders that REDUCE position are copied[/dim]")
+        config['max_position_notional'] = float(input("Max Position $ (default 0=unlimited): ").strip() or "0")
         
         # Position mirror mode
         self.console.print("\n[bold]Position Mirror Mode[/bold]")
@@ -797,6 +804,60 @@ class GridCopyTerminal:
         
         return True  # FLAT - copy all
     
+    def check_max_position(self, order_side: str, order_price: float) -> bool:
+        """
+        Check if order should be allowed based on max position limit.
+        
+        Args:
+            order_side: 'BUY' or 'SELL'
+            order_price: Order price (for notional calculation)
+        
+        Returns:
+            True if order is allowed, False if blocked by max position
+        """
+        max_notional = self.config.get('max_position_notional', 0)
+        
+        # If no limit set, allow all
+        if max_notional <= 0:
+            return True
+        
+        # Get current position
+        our_size = self.current_position.get('size', 0)
+        our_side = self.current_position.get('side')
+        entry_price = self.current_position.get('entry_price', 0)
+        
+        # Calculate current position notional
+        if entry_price > 0:
+            current_notional = abs(our_size * entry_price)
+        else:
+            current_notional = abs(our_size * order_price)  # Estimate with order price
+        
+        # If under limit, allow all orders
+        if current_notional < max_notional:
+            return True
+        
+        # At or over limit - only allow orders that REDUCE position
+        if our_side == 'LONG':
+            # LONG position: SELL reduces, BUY increases
+            if order_side == 'SELL':
+                self._verbose_log(f"  Max position: SELL allowed (reduces LONG)")
+                return True
+            else:
+                self._verbose_log(f"  Max position: BUY blocked (would increase LONG, ${current_notional:.0f} >= ${max_notional:.0f})")
+                return False
+        
+        elif our_side == 'SHORT':
+            # SHORT position: BUY reduces, SELL increases
+            if order_side == 'BUY':
+                self._verbose_log(f"  Max position: BUY allowed (reduces SHORT)")
+                return True
+            else:
+                self._verbose_log(f"  Max position: SELL blocked (would increase SHORT, ${current_notional:.0f} >= ${max_notional:.0f})")
+                return False
+        
+        # FLAT - allow all (shouldn't reach here if current_notional > 0)
+        return True
+    
     async def _handle_order_event(self, message: Dict):
         """Handle real-time order event from WebSocket - queues for batch processing"""
         try:
@@ -923,6 +984,12 @@ class GridCopyTerminal:
                 if not self.should_copy_order(order_record['side'], price):
                     self._verbose_log(f"  Skipping: mirror filter ({self.copy_side_mode} only)")
                     self.orders_skipped_mirror += 1
+                    return
+                
+                # Skip if max position limit reached
+                if not self.check_max_position(order_record['side'], price):
+                    self._verbose_log(f"  Skipping: max position limit")
+                    self.orders_skipped_max_position += 1
                     return
                 
                 # Fetch balance before placing order
@@ -2252,6 +2319,7 @@ class GridCopyTerminal:
         skipped_size = 0
         skipped_margin = 0
         skipped_mirror = 0
+        skipped_max_position = 0
         
         # Clear margin failures if balance increased significantly (order filled = freed margin)
         if self.available_balance > self.last_balance_for_retry * 1.05:  # 5% increase
@@ -2273,6 +2341,11 @@ class GridCopyTerminal:
                     skipped_mirror += 1
                     continue
                 
+                # Skip if max position limit reached
+                if not self.check_max_position(target_order['side'], target_order['price']):
+                    skipped_max_position += 1
+                    continue
+                
                 # Check if we've hit max orders
                 if len(self.our_orders) + len(orders_to_place) >= self.config['max_open_orders']:
                     skipped_max += 1
@@ -2290,8 +2363,11 @@ class GridCopyTerminal:
                 else:
                     skipped_size += 1
         
-        if skipped_max > 0 or skipped_size > 0 or skipped_margin > 0 or skipped_mirror > 0:
-            self._debug_log(f"SYNC: Skipped - max:{skipped_max}, size:{skipped_size}, margin:{skipped_margin}, mirror:{skipped_mirror}")
+        if skipped_max > 0 or skipped_size > 0 or skipped_margin > 0 or skipped_mirror > 0 or skipped_max_position > 0:
+            self._debug_log(f"SYNC: Skipped - max:{skipped_max}, size:{skipped_size}, margin:{skipped_margin}, mirror:{skipped_mirror}, maxpos:{skipped_max_position}")
+        
+        # Update global counter
+        self.orders_skipped_max_position += skipped_max_position
         
         # Place orders (parallel or sequential)
         if orders_to_place:
@@ -2477,6 +2553,7 @@ class GridCopyTerminal:
         # Collect orders to place
         orders_to_place = []
         skipped_mirror = 0
+        skipped_max_position = 0
         for target_id, target_order in target_orders.items():
             if len(orders_to_place) >= self.config['max_open_orders']:
                 break
@@ -2484,6 +2561,11 @@ class GridCopyTerminal:
             # Skip if filtered by position mirror
             if not self.should_copy_order(target_order['side'], target_order['price']):
                 skipped_mirror += 1
+                continue
+            
+            # Skip if max position limit reached
+            if not self.check_max_position(target_order['side'], target_order['price']):
+                skipped_max_position += 1
                 continue
             
             our_size = self.calculate_our_size(target_order['size'], target_order['price'])
@@ -2497,6 +2579,10 @@ class GridCopyTerminal:
         if skipped_mirror > 0:
             self.console.print(f"[yellow]Skipped {skipped_mirror} orders (mirror mode: {self.copy_side_mode} only)[/yellow]")
             self.orders_skipped_mirror += skipped_mirror
+        
+        if skipped_max_position > 0:
+            self.console.print(f"[yellow]Skipped {skipped_max_position} orders (max position limit)[/yellow]")
+            self.orders_skipped_max_position += skipped_max_position
         
         if not orders_to_place:
             self.console.print("[yellow]No valid orders to place (check sizing config)[/yellow]")
@@ -2658,6 +2744,18 @@ class GridCopyTerminal:
             text.append(f"Entry Price      ", style="white")
             text.append(f"${pos['entry_price']:.4f}\n", style="dim")
             
+            # Position notional value
+            pos_notional = abs(pos['size'] * pos['entry_price']) if pos['entry_price'] > 0 else 0
+            max_pos = self.config.get('max_position_notional', 0)
+            text.append(f"Notional         ", style="white")
+            if max_pos > 0:
+                pct_of_max = (pos_notional / max_pos * 100) if max_pos > 0 else 0
+                notional_color = "red" if pct_of_max >= 100 else ("yellow" if pct_of_max >= 80 else "cyan")
+                text.append(f"${pos_notional:.2f}", style=notional_color)
+                text.append(f" / ${max_pos:.0f} ({pct_of_max:.0f}%)\n", style="dim")
+            else:
+                text.append(f"${pos_notional:.2f}\n", style="cyan")
+            
             text.append(f"Unrealized PnL   ", style="white")
             pnl_color = "green" if pos['unrealized_pnl'] >= 0 else "red"
             text.append(f"${pos['unrealized_pnl']:.2f} ({pos['unrealized_pnl_pct']:.2f}%)\n", style=pnl_color)
@@ -2746,13 +2844,16 @@ class GridCopyTerminal:
         text.append(f"Fills Detected   ", style="white")
         text.append(f"{self.orders_filled}\n", style="green")
         
-        if self.orders_skipped > 0 or self.orders_skipped_mirror > 0 or self.orders_failed > 0 or self.orders_rejected_postonly > 0 or self.orders_rate_limited > 0:
+        if self.orders_skipped > 0 or self.orders_skipped_mirror > 0 or self.orders_skipped_max_position > 0 or self.orders_failed > 0 or self.orders_rejected_postonly > 0 or self.orders_rate_limited > 0:
             text.append(f"\n", style="white")
             text.append(f"Skipped (size)   ", style="white")
             text.append(f"{self.orders_skipped}\n", style="dim")
             if self.orders_skipped_mirror > 0:
                 text.append(f"Skipped (mirror) ", style="white")
                 text.append(f"{self.orders_skipped_mirror}\n", style="yellow")
+            if self.orders_skipped_max_position > 0:
+                text.append(f"Skipped (maxpos) ", style="white")
+                text.append(f"{self.orders_skipped_max_position}\n", style="yellow")
             text.append(f"Failed (API)     ", style="white")
             text.append(f"{self.orders_failed}\n", style="red")
             text.append(f"Rejected (maker) ", style="white")
@@ -2768,6 +2869,11 @@ class GridCopyTerminal:
         
         text.append(f"Max Order %      ", style="white")
         text.append(f"{self.config.get('max_order_percent', 10)}%\n", style="white")
+        
+        max_pos = self.config.get('max_position_notional', 0)
+        if max_pos > 0:
+            text.append(f"Max Position     ", style="white")
+            text.append(f"${max_pos:.0f}\n", style="cyan")
         
         fixed_size = self.config.get('fixed_order_size', 0)
         if fixed_size > 0:

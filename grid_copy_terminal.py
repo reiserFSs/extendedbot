@@ -17,6 +17,7 @@ import json
 import sys
 import logging
 import math
+import aiohttp
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -111,10 +112,10 @@ class GridCopyTerminal:
         self.margin_failed_targets: set = set()   # target_ids that failed due to margin
         self.last_balance_for_retry = 0.0         # Balance when margin failures occurred
         
-        # Orderbook cache (short TTL to stay fresh but reduce API calls)
+        # Orderbook cache (updated by WebSocket stream)
         self.orderbook_cache: Dict[str, Dict] = {}  # market -> {best_bid, best_ask, timestamp}
-        self.orderbook_cache_ttl = 2.0  # 2s cache - background refresh keeps it fresh
-        self.orderbook_refresh_task = None
+        self.orderbook_ws = None
+        self.orderbook_ws_connected = False
         
         # Pending actions queue (from WebSocket events)
         self.pending_actions: asyncio.Queue = None  # Will init in run()
@@ -878,72 +879,91 @@ class GridCopyTerminal:
         self._debug_log(f"💾 Saved learned specs for {coin}: step={step_size}, tick={tick_size}")
     
     async def _fetch_orderbook(self, market_name: str) -> Dict:
-        """Get orderbook from cache (non-blocking). Background task keeps it fresh."""
-        # Always return from cache - background task keeps it updated
+        """Get orderbook from cache (updated by WebSocket stream)."""
         if market_name in self.orderbook_cache:
             cached = self.orderbook_cache[market_name]
             return {'best_bid': cached['best_bid'], 'best_ask': cached['best_ask']}
         
-        # Cache miss - do a quick fetch (only happens on first call)
-        return await self._refresh_orderbook(market_name)
+        # No cache yet - return zeros, WebSocket will populate
+        return {'best_bid': 0, 'best_ask': 0}
     
-    async def _refresh_orderbook(self, market_name: str) -> Dict:
-        """Actually fetch orderbook from API and update cache"""
+    async def _start_orderbook_websocket(self, market_name: str):
+        """Start WebSocket stream for real-time orderbook updates (10ms best bid/ask)"""
+        
+        # Use depth=1 for best bid/ask only (10ms updates)
+        ws_url = f"wss://stream.extended.exchange/v1/orderbooks/{market_name}?depth=1"
+        self._debug_log(f"ORDERBOOK WS: Connecting to {ws_url}")
+        
         try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(ws_url) as ws:
+                    self.orderbook_ws = ws
+                    self.orderbook_ws_connected = True
+                    self._debug_log(f"ORDERBOOK WS: Connected")
+                    
+                    async for msg in ws:
+                        if not self.is_running:
+                            break
+                            
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = json.loads(msg.data)
+                                self._process_orderbook_message(market_name, data)
+                            except json.JSONDecodeError:
+                                pass
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            self._debug_log(f"ORDERBOOK WS ERROR: {ws.exception()}")
+                            break
+                        elif msg.type == aiohttp.WSMsgType.CLOSED:
+                            self._debug_log(f"ORDERBOOK WS: Closed")
+                            break
+                    
+        except Exception as e:
+            self._debug_log(f"ORDERBOOK WS EXCEPTION: {e}")
+        finally:
+            self.orderbook_ws_connected = False
+            self.orderbook_ws = None
+    
+    def _process_orderbook_message(self, market_name: str, data: dict):
+        """Process orderbook WebSocket message and update cache"""
+        try:
+            # Handle wrapped format: {type, ts, data: {m, t, b, a}, seq}
+            ob_data = data.get('data', data)
+            
+            bids = ob_data.get('b', [])
+            asks = ob_data.get('a', [])
+            
             best_bid = 0
             best_ask = 0
             
-            # Method 1: orderbook module
-            if hasattr(self.extended_client, 'orderbook'):
-                try:
-                    ob = await self.extended_client.orderbook.get_orderbook(market_name)
-                    if ob and hasattr(ob, 'data'):
-                        data = ob.data
-                        best_bid = float(data.bids[0].price) if data.bids else 0
-                        best_ask = float(data.asks[0].price) if data.asks else 0
-                except Exception as e:
-                    pass
+            if bids:
+                # Best bid is first in sorted list
+                best_bid = float(bids[0].get('p', 0))
             
-            # Method 2: markets_info with ticker
-            if (best_bid == 0 or best_ask == 0) and hasattr(self.extended_client, 'markets_info'):
-                try:
-                    markets = await self.extended_client.markets_info.get_markets(market_names=[market_name])
-                    if markets and markets.data:
-                        md = markets.data[0]
-                        best_bid = float(getattr(md, 'best_bid', 0) or getattr(md, 'bid_price', 0) or 0)
-                        best_ask = float(getattr(md, 'best_ask', 0) or getattr(md, 'ask_price', 0) or 0)
-                        if best_bid == 0 and best_ask == 0:
-                            index_price = float(getattr(md, 'index_price', 0) or 0)
-                            if index_price > 0:
-                                best_bid = index_price
-                                best_ask = index_price
-                except Exception as e:
-                    pass
+            if asks:
+                # Best ask is first in sorted list  
+                best_ask = float(asks[0].get('p', 0))
             
-            # Cache the result
-            self.orderbook_cache[market_name] = {
-                'best_bid': best_bid,
-                'best_ask': best_ask,
-                'timestamp': time.time()
-            }
-            
-            return {'best_bid': best_bid, 'best_ask': best_ask}
-            
+            if best_bid > 0 or best_ask > 0:
+                self.orderbook_cache[market_name] = {
+                    'best_bid': best_bid,
+                    'best_ask': best_ask,
+                    'timestamp': time.time()
+                }
+                
         except Exception as e:
-            self._debug_log(f"ORDERBOOK REFRESH ERROR: {e}")
-            return {'best_bid': 0, 'best_ask': 0}
+            self._debug_log(f"ORDERBOOK PARSE ERROR: {e}")
     
-    async def _background_orderbook_refresh(self):
-        """Background task to keep orderbook cache fresh"""
+    async def _orderbook_websocket_loop(self, market_name: str):
+        """Maintain orderbook WebSocket connection with auto-reconnect"""
         while self.is_running:
             try:
-                if self.watch_token:
-                    market_name = self._get_extended_market(self.watch_token)
-                    if market_name:
-                        await self._refresh_orderbook(market_name)
-                await asyncio.sleep(1.0)  # Refresh every 1 second
+                await self._start_orderbook_websocket(market_name)
             except Exception as e:
-                self._debug_log(f"Background orderbook error: {e}")
+                self._debug_log(f"ORDERBOOK WS LOOP ERROR: {e}")
+            
+            if self.is_running:
+                self._debug_log("ORDERBOOK WS: Reconnecting in 1s...")
                 await asyncio.sleep(1.0)
     
     def _adjust_price_for_maker(self, price: float, side: str, best_bid: float, best_ask: float, tick_size: float) -> float:
@@ -1514,6 +1534,19 @@ class GridCopyTerminal:
         else:
             text.append(f"Polling\n", style="yellow")
         
+        # Orderbook WebSocket status
+        text.append(f"Orderbook        ", style="white")
+        if self.orderbook_ws_connected:
+            cached = self.orderbook_cache.get(self._get_extended_market(self.watch_token) or '', {})
+            bid = cached.get('best_bid', 0)
+            ask = cached.get('best_ask', 0)
+            if bid > 0:
+                text.append(f"${bid:.4f}/${ask:.4f}\n", style="green")
+            else:
+                text.append(f"Connected\n", style="green")
+        else:
+            text.append(f"Connecting...\n", style="yellow")
+        
         text.append(f"\n", style="white")
         
         text.append(f"Target Orders    ", style="white")
@@ -1718,15 +1751,6 @@ class GridCopyTerminal:
         else:
             self.console.print(f"[green]✓ Available balance: ${self.available_balance:.2f}[/green]")
         
-        # Pre-fetch orderbook for zero-latency maker pricing
-        if self.watch_token:
-            market_name = self._get_extended_market(self.watch_token)
-            if market_name:
-                self.console.print("[dim]Fetching orderbook...[/dim]")
-                ob = await self._refresh_orderbook(market_name)
-                if ob['best_bid'] > 0:
-                    self.console.print(f"[green]✓ Orderbook: bid=${ob['best_bid']:.4f}, ask=${ob['best_ask']:.4f}[/green]")
-        
         # Do initial REST sync to get current orders
         self.console.print("[dim]Fetching initial orders...[/dim]")
         try:
@@ -1759,8 +1783,13 @@ class GridCopyTerminal:
         
         keyboard_task = asyncio.create_task(handle_keyboard())
         
-        # Start background orderbook refresh for zero-latency maker pricing
-        orderbook_task = asyncio.create_task(self._background_orderbook_refresh())
+        # Start orderbook WebSocket for real-time bid/ask (10ms updates)
+        orderbook_task = None
+        if self.watch_token:
+            market_name = self._get_extended_market(self.watch_token)
+            if market_name:
+                self.console.print(f"[dim]Connecting to orderbook stream...[/dim]")
+                orderbook_task = asyncio.create_task(self._orderbook_websocket_loop(market_name))
         
         last_rest_sync = time.time()
         
@@ -1804,7 +1833,8 @@ class GridCopyTerminal:
             self._debug_log("Entering finally block")
             self.is_running = False
             keyboard_task.cancel()
-            orderbook_task.cancel()
+            if orderbook_task:
+                orderbook_task.cancel()
             
             # Cleanup - cancel all our orders
             self.console.print("\n[yellow]Cleaning up - cancelling all orders...[/yellow]")

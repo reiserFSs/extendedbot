@@ -108,6 +108,8 @@ class GridCopyTerminal:
         self.target_orders: Dict[str, Dict] = {}  # order_id -> order_info
         self.our_orders: Dict[str, Dict] = {}     # our_order_id -> order_info
         self.order_mapping: Dict[str, str] = {}   # target_order_id -> our_order_id
+        self.margin_failed_targets: set = set()   # target_ids that failed due to margin
+        self.last_balance_for_retry = 0.0         # Balance when margin failures occurred
         
         # Pending actions queue (from WebSocket events)
         self.pending_actions: asyncio.Queue = None  # Will init in run()
@@ -548,6 +550,16 @@ class GridCopyTerminal:
             self._debug_log(f"  Status=open, was_new={was_new}")
             
             if was_new and oid not in self.order_mapping:
+                # Check if we've hit max orders
+                if len(self.our_orders) >= self.config['max_open_orders']:
+                    self._debug_log(f"  Skipping: at max orders ({len(self.our_orders)})")
+                    return
+                
+                # Skip if margin-failed before
+                if oid in self.margin_failed_targets:
+                    self._debug_log(f"  Skipping: margin-failed previously")
+                    return
+                
                 # Fetch balance before placing order
                 await self.fetch_balance()
                 
@@ -573,6 +585,10 @@ class GridCopyTerminal:
                             'value': our_size * price,
                             'target_id': oid
                         }
+                    else:
+                        # Failed - mark for margin retry
+                        self.margin_failed_targets.add(oid)
+                        self.last_balance_for_retry = self.available_balance
             elif oid in self.order_mapping:
                 # Existing order - check if price changed
                 our_id = self.order_mapping[oid]
@@ -976,6 +992,12 @@ class GridCopyTerminal:
                             # Price precision error - try next tick size
                             self._debug_log(f"    → Tick {try_tick} wrong, trying next...")
                             continue  # Try next tick_size
+                        elif '1140' in error_msg:
+                            # Margin/balance error - don't retry until balance changes
+                            self._debug_log(f"    → Margin insufficient, need more balance")
+                            self.log_activity("PLACE", coin, "Margin exceeded", "error")
+                            self.orders_failed += 1
+                            return None
                         else:
                             # Different error - log full details and stop retrying
                             self._debug_log(f"    → Non-precision error code, stopping retries")
@@ -1109,12 +1131,27 @@ class GridCopyTerminal:
         self.target_orders = target_orders
         
         actions_taken = 0
+        skipped_max = 0
+        skipped_size = 0
+        skipped_margin = 0
+        
+        # Clear margin failures if balance increased significantly (order filled = freed margin)
+        if self.available_balance > self.last_balance_for_retry * 1.05:  # 5% increase
+            self._debug_log(f"SYNC: Balance increased, clearing {len(self.margin_failed_targets)} margin failures")
+            self.margin_failed_targets.clear()
+            self.last_balance_for_retry = self.available_balance
         
         # 1. Place orders for new target orders
         for target_id, target_order in target_orders.items():
             if target_id not in self.order_mapping:
+                # Skip if previously failed due to margin (unless balance changed)
+                if target_id in self.margin_failed_targets:
+                    skipped_margin += 1
+                    continue
+                
                 # Check if we've hit max orders
                 if len(self.our_orders) >= self.config['max_open_orders']:
+                    skipped_max += 1
                     continue
                 
                 # Calculate our size
@@ -1141,6 +1178,19 @@ class GridCopyTerminal:
                             'target_id': target_id
                         }
                         actions_taken += 1
+                    else:
+                        # Mark as margin-failed if that was the error
+                        # (The place_order function logs the error type)
+                        self.margin_failed_targets.add(target_id)
+                        self.last_balance_for_retry = self.available_balance
+                    
+                    # Small delay to avoid rate limiting
+                    # await asyncio.sleep(0.05)  # Rate limit disabled
+                else:
+                    skipped_size += 1
+        
+        if skipped_max > 0 or skipped_size > 0 or skipped_margin > 0:
+            self._debug_log(f"SYNC: Skipped - max:{skipped_max}, size:{skipped_size}, margin:{skipped_margin}")
         
         # 2. Cancel orders where target cancelled
         stale_mappings = []
@@ -1154,9 +1204,13 @@ class GridCopyTerminal:
                     actions_taken += 1
                 stale_mappings.append(target_id)
         
-        # Clean up stale mappings
+        # Clean up stale mappings and margin failures
         for target_id in stale_mappings:
             del self.order_mapping[target_id]
+            self.margin_failed_targets.discard(target_id)
+        
+        # Also clean margin failures for orders no longer in target list
+        self.margin_failed_targets = self.margin_failed_targets & set(target_orders.keys())
         
         # 3. Update orders where target changed price significantly
         for target_id, target_order in target_orders.items():
@@ -1291,10 +1345,24 @@ class GridCopyTerminal:
         text.append(f"{len(self.target_orders)}\n", style="cyan")
         
         text.append(f"Our Orders       ", style="white")
-        text.append(f"{len(self.our_orders)}\n", style="cyan")
+        max_orders = self.config.get('max_open_orders', 75)
+        if len(self.our_orders) >= max_orders:
+            text.append(f"{len(self.our_orders)}/{max_orders} [MAX]\n", style="red")
+        else:
+            text.append(f"{len(self.our_orders)}/{max_orders}\n", style="cyan")
         
         text.append(f"Mapped Orders    ", style="white")
         text.append(f"{len(self.order_mapping)}\n", style="cyan")
+        
+        # Show unmapped count
+        unmapped = len(self.target_orders) - len(self.order_mapping)
+        if unmapped > 0:
+            text.append(f"Unmapped         ", style="white")
+            text.append(f"{unmapped}", style="yellow")
+            if len(self.margin_failed_targets) > 0:
+                text.append(f" ({len(self.margin_failed_targets)} margin)\n", style="red")
+            else:
+                text.append(f"\n", style="yellow")
         
         text.append(f"\n", style="white")
         
@@ -1491,7 +1559,7 @@ class GridCopyTerminal:
                         key = sys.stdin.read(1).lower()
                         if key == 'q':
                             self.is_running = False
-                    await asyncio.sleep(0.1)
+                    # await asyncio.sleep(0.1)  # Rate limit disabled
             finally:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         
@@ -1521,7 +1589,7 @@ class GridCopyTerminal:
                     layout["footer"].update(self.render_footer())
                     
                     # Fast loop for responsive UI (WebSocket handles order events)
-                    await asyncio.sleep(0.1)
+                    # await asyncio.sleep(0.1)  # Rate limit disabled
         
         finally:
             self.is_running = False

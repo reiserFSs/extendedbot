@@ -2613,12 +2613,18 @@ class GridCopyTerminal:
         self.target_orders = target_orders
         
         actions_taken = 0
-        skipped_max = 0
         skipped_size = 0
         skipped_margin = 0
         skipped_mirror = 0
         skipped_max_position = 0
         skipped_range = 0
+        
+        # Get mid price for priority sorting
+        market_name = self._get_extended_market(self.watch_token)
+        cached_ob = self.orderbook_cache.get(market_name, {}) if market_name else {}
+        best_bid = cached_ob.get('best_bid', 0)
+        best_ask = cached_ob.get('best_ask', 0)
+        mid_price = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0
         
         # Clear margin failures if balance increased significantly (order filled = freed margin)
         if self.available_balance > self.last_balance_for_retry * 1.05:  # 5% increase
@@ -2626,8 +2632,8 @@ class GridCopyTerminal:
             self.margin_failed_targets.clear()
             self.last_balance_for_retry = self.available_balance
         
-        # 1. Collect orders to place
-        orders_to_place = []
+        # 1. Collect ALL valid orders first (before applying limit)
+        all_valid_orders = []
         for target_id, target_order in target_orders.items():
             if target_id not in self.order_mapping:
                 # Skip if previously failed due to margin
@@ -2650,25 +2656,31 @@ class GridCopyTerminal:
                     skipped_range += 1
                     continue
                 
-                # Check if we've hit max orders
-                if len(self.our_orders) + len(orders_to_place) >= self.config['max_open_orders']:
-                    skipped_max += 1
-                    continue
-                
                 # Calculate our size
                 our_size = self.calculate_our_size(target_order['size'], target_order['price'])
                 
                 if our_size > 0:
-                    orders_to_place.append({
+                    # Calculate distance from mid for priority sorting
+                    distance = abs(target_order['price'] - mid_price) if mid_price > 0 else 0
+                    all_valid_orders.append({
                         'target_id': target_id,
                         'target_order': target_order,
-                        'our_size': our_size
+                        'our_size': our_size,
+                        'distance': distance
                     })
                 else:
                     skipped_size += 1
         
-        if skipped_max > 0 or skipped_size > 0 or skipped_margin > 0 or skipped_mirror > 0 or skipped_max_position > 0 or skipped_range > 0:
-            self._debug_log(f"SYNC: Skipped - max:{skipped_max}, size:{skipped_size}, margin:{skipped_margin}, mirror:{skipped_mirror}, maxpos:{skipped_max_position}, range:{skipped_range}")
+        # 2. Sort by distance (closest to mid first)
+        all_valid_orders.sort(key=lambda x: x['distance'])
+        
+        # 3. Apply max orders limit (considering existing orders)
+        available_slots = self.config['max_open_orders'] - len(self.our_orders)
+        orders_to_place = all_valid_orders[:max(0, available_slots)]
+        skipped_limit = len(all_valid_orders) - len(orders_to_place)
+        
+        if skipped_size > 0 or skipped_margin > 0 or skipped_mirror > 0 or skipped_max_position > 0 or skipped_range > 0 or skipped_limit > 0:
+            self._debug_log(f"SYNC: Skipped - size:{skipped_size}, margin:{skipped_margin}, mirror:{skipped_mirror}, maxpos:{skipped_max_position}, range:{skipped_range}, limit:{skipped_limit}")
         
         # Update global counters
         self.orders_skipped_max_position += skipped_max_position
@@ -2847,6 +2859,7 @@ class GridCopyTerminal:
                 self._debug_log(f"Precision pre-compute warning: {e}")
         
         # Pre-fetch orderbook for maker pricing
+        mid_price = 0
         if self.watch_token:
             market_name = self._get_extended_market(self.watch_token)
             if market_name:
@@ -2854,16 +2867,14 @@ class GridCopyTerminal:
                 ob = await self._fetch_orderbook_rest(market_name)
                 if ob['best_bid'] > 0:
                     self.console.print(f"[green]✓ Orderbook: bid=${ob['best_bid']:.4f}, ask=${ob['best_ask']:.4f}[/green]")
+                    mid_price = (ob['best_bid'] + ob['best_ask']) / 2
         
-        # Collect orders to place
-        orders_to_place = []
+        # Collect ALL valid orders first (before applying limit)
+        all_valid_orders = []
         skipped_mirror = 0
         skipped_max_position = 0
         skipped_range = 0
         for target_id, target_order in target_orders.items():
-            if len(orders_to_place) >= self.config['max_open_orders']:
-                break
-            
             # Skip if filtered by position mirror
             if not self.should_copy_order(target_order['side'], target_order['price']):
                 skipped_mirror += 1
@@ -2881,11 +2892,22 @@ class GridCopyTerminal:
             
             our_size = self.calculate_our_size(target_order['size'], target_order['price'])
             if our_size > 0:
-                orders_to_place.append({
+                # Calculate distance from mid for priority sorting
+                distance = abs(target_order['price'] - mid_price) if mid_price > 0 else 0
+                all_valid_orders.append({
                     'target_id': target_id,
                     'target_order': target_order,
-                    'our_size': our_size
+                    'our_size': our_size,
+                    'distance': distance
                 })
+        
+        # Sort by distance (closest to mid first) and take top N
+        all_valid_orders.sort(key=lambda x: x['distance'])
+        orders_to_place = all_valid_orders[:self.config['max_open_orders']]
+        
+        skipped_limit = len(all_valid_orders) - len(orders_to_place)
+        if skipped_limit > 0:
+            self.console.print(f"[yellow]Prioritized {len(orders_to_place)} closest orders (skipped {skipped_limit} far orders)[/yellow]")
         
         if skipped_mirror > 0:
             self.console.print(f"[yellow]Skipped {skipped_mirror} orders (mirror mode: {self.copy_side_mode} only)[/yellow]")
